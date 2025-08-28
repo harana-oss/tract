@@ -33,10 +33,130 @@ impl Iff {
         f: &Tensor,
     ) {
         unsafe {
-            Zip::from(out.to_array_view_mut_unchecked::<T>())
-                .and_broadcast(cond)
-                .and_broadcast(t.to_array_view_unchecked::<T>())
-                .and_broadcast(f.to_array_view_unchecked::<T>())
+            // Prepare views once
+            let mut out_view = out.to_array_view_mut_unchecked::<T>();
+            let t_view = t.to_array_view_unchecked::<T>();
+            let f_view = f.to_array_view_unchecked::<T>();
+            let out_shape: Vec<usize> = out_view.shape().to_vec();
+
+            // Helper: copy src -> out with broadcasting (or memcpy when possible)
+            #[inline(always)]
+            unsafe fn copy_into<T: Datum>(out_view: &mut ArrayViewMutD<T>, src: &ArrayViewD<T>) {
+                if src.shape() == out_view.shape() {
+                    if let (Some(dst), Some(s)) =
+                        (out_view.as_slice_memory_order_mut(), src.as_slice_memory_order())
+                    {
+                        dst.clone_from_slice(s);
+                        return;
+                    }
+                }
+                Zip::from(out_view.view_mut())
+                    .and_broadcast(src.view())
+                    .for_each(|o, s| *o = s.clone());
+            }
+
+            // Fast path 1: cond is a single element (broadcasted scalar)
+            if cond.len() == 1 {
+                let c0 = *cond.iter().next().unwrap_or(&false);
+                if c0 {
+                    copy_into(&mut out_view, &t_view);
+                } else {
+                    copy_into(&mut out_view, &f_view);
+                }
+                return;
+            }
+
+            // Fast path 2: cond is all true or all false (any shape)
+            let mut any_false = false;
+            for &c in cond.iter() {
+                if !c {
+                    any_false = true;
+                    break;
+                }
+            }
+            if !any_false {
+                copy_into(&mut out_view, &t_view);
+                return;
+            }
+            let mut any_true = false;
+            for &c in cond.iter() {
+                if c {
+                    any_true = true;
+                    break;
+                }
+            }
+            if !any_true {
+                copy_into(&mut out_view, &f_view);
+                return;
+            }
+
+            // Fast path 3: all have identical shape and contiguous layout -> tight loop
+            if cond.shape() == out_shape.as_slice()
+                && t_view.shape() == out_shape.as_slice()
+                && f_view.shape() == out_shape.as_slice()
+            {
+                if let (Some(cnd), Some(ts), Some(fs), Some(dst)) = (
+                    cond.as_slice_memory_order(),
+                    t_view.as_slice_memory_order(),
+                    f_view.as_slice_memory_order(),
+                    out_view.as_slice_memory_order_mut(),
+                ) {
+                    for i in 0..dst.len() {
+                        dst[i] = if cnd[i] { ts[i].clone() } else { fs[i].clone() };
+                    }
+                    return;
+                }
+            }
+
+            // Fast path 4: t is scalar
+            if t_view.len() == 1 {
+                let t0 = t_view.iter().next().unwrap().clone();
+                if cond.shape() == out_shape.as_slice() && f_view.shape() == out_shape.as_slice() {
+                    if let (Some(cnd), Some(fs), Some(dst)) = (
+                        cond.as_slice_memory_order(),
+                        f_view.as_slice_memory_order(),
+                        out_view.as_slice_memory_order_mut(),
+                    ) {
+                        for i in 0..dst.len() {
+                            dst[i] = if cnd[i] { t0.clone() } else { fs[i].clone() };
+                        }
+                        return;
+                    }
+                }
+                Zip::from(out_view.view_mut())
+                    .and_broadcast(cond.view())
+                    .and_broadcast(f_view.view())
+                    .for_each(|o, &c, fv| *o = if c { t0.clone() } else { fv.clone() });
+                return;
+            }
+
+            // Fast path 5: f is scalar
+            if f_view.len() == 1 {
+                let f0 = f_view.iter().next().unwrap().clone();
+                if cond.shape() == out_shape.as_slice() && t_view.shape() == out_shape.as_slice() {
+                    if let (Some(cnd), Some(ts), Some(dst)) = (
+                        cond.as_slice_memory_order(),
+                        t_view.as_slice_memory_order(),
+                        out_view.as_slice_memory_order_mut(),
+                    ) {
+                        for i in 0..dst.len() {
+                            dst[i] = if cnd[i] { ts[i].clone() } else { f0.clone() };
+                        }
+                        return;
+                    }
+                }
+                Zip::from(out_view.view_mut())
+                    .and_broadcast(cond.view())
+                    .and_broadcast(t_view.view())
+                    .for_each(|o, &c, tv| *o = if c { tv.clone() } else { f0.clone() });
+                return;
+            }
+
+            // Fallback: generic broadcasting with branching per element
+            Zip::from(out_view)
+                .and_broadcast(cond.view())
+                .and_broadcast(t_view)
+                .and_broadcast(f_view)
                 .for_each(|r, c, t, f| *r = if *c { t.clone() } else { f.clone() })
         }
     }

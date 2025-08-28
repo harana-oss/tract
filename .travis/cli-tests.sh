@@ -82,6 +82,18 @@ $TRACT_RUN $MODELS/inceptionv1_quant.nnef.tar.gz \
     --allow-random-input \
     --assert-output-bundle $MODELS/inceptionv1_quant.io.npz
 
+echo $WHITE     ml $NC
+# 2D input: [1,5] features
+$TRACT_RUN onnx/test_cases/linear_classifier/model.onnx \
+    -O -i 1,5,f32 \
+    run -q \
+    --allow-random-input
+# 1D input: [5] features (batch axis will be added by the op wiring)
+$TRACT_RUN onnx/test_cases/linear_classifier/model.onnx \
+    -O -i 5,f32 \
+    run -q \
+    --allow-random-input
+
 echo $WHITE     audio $NC
 
 $CACHE_FILE ARM-ML-KWS-CNN-M.pb
