@@ -24,13 +24,23 @@ log.workspace = true
 memmap2.workspace = true
 num-integer.workspace = true
 prost.workspace = true
+rand.workspace = true
+rand_xoshiro.workspace = true
+rayon.workspace = true
 smallvec.workspace = true
+snmalloc-rs.workspace = true
 tract-nnef.workspace = true
 tract-hir.workspace = true
 tract-onnx-opl.workspace = true
 
 [dev-dependencies]
 env_logger.workspace = true
+criterion.workspace = true
+ureq = { version = "2", default-features = true }
+
+[[bench]]
+name = "linear_regressor"
+harness = false
 
 # [build-dependencies]
 # protobuf-src = "1.0.5+3.19.3"
@@ -39,3 +49,9 @@ env_logger.workspace = true
 [features]
 default = []
 getrandom-js = ["tract-onnx-opl/getrandom-js"]
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
