@@ -1,9 +1,6 @@
 use crate::model::{OnnxOpRegister, ParsingContext};
 use crate::pb::NodeProto;
-use tract_core::ops::math::{abs, div, max, mul, rsqrt, square};
-use tract_core::ops::nn::{Reduce, Reducer};
 use tract_hir::internal::*;
-use tract_hir::ops::logic::wire_with_rank_broadcast;
 
 pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("Normalizer", normalizer);
@@ -63,80 +60,20 @@ impl Expansion for Normalizer {
         model: &mut TypedModel,
         inputs: &[OutletId],
     ) -> TractResult<TVec<OutletId>> {
-        let input_fact = model.outlet_fact(inputs[0])?.clone();
-        let rank = input_fact.rank();
-        ensure!(rank >= 1, "Normalizer expects rank 1 or 2 inputs");
-        let axis = rank - 1; // normalize along last (C) axis
-
-        let mut x = inputs[0];
-        let x_fact = model.outlet_fact(x)?.clone();
-
-        if x_fact.datum_type != f32::datum_type() {
-            x = model.wire_node(
-                format!("{prefix}.to_f32"),
-                tract_core::ops::cast::cast(f32::datum_type()),
-                &[x],
-            )?[0];
-        }
-
-        // Epsilon to avoid division by zero and remove conditional selection
-        let eps = model.add_const(format!("{prefix}.eps"), rctensor0(1e-12f32))?;
-
-        // Branchless normalization per norm kind
-        let y = match self.kind {
-            NormKind::Max => {
-                // denom = max(reduce_max(abs(x), axis), eps); y = x / denom
-                let ax = model.wire_node(format!("{prefix}.abs"), abs(), &[x])?;
-                let d0 = model.wire_node(
-                    format!("{prefix}.max"),
-                    Reduce { axes: tvec![axis], reducer: Reducer::Max },
-                    &ax,
-                )?[0];
-                let d = wire_with_rank_broadcast(
-                    format!("{prefix}.clamp_max"),
-                    model,
-                    max(),
-                    &[d0, eps],
-                )?[0];
-                wire_with_rank_broadcast(format!("{prefix}.div_max"), model, div(), &[x, d])?[0]
-            }
-            NormKind::L1 => {
-                // denom = max(reduce_sum(abs(x), axis), eps); y = x / denom
-                let ax = model.wire_node(format!("{prefix}.abs"), abs(), &[x])?;
-                let d0 = model.wire_node(
-                    format!("{prefix}.sum_abs"),
-                    Reduce { axes: tvec![axis], reducer: Reducer::Sum },
-                    &ax,
-                )?[0];
-                let d = wire_with_rank_broadcast(
-                    format!("{prefix}.clamp_l1"),
-                    model,
-                    max(),
-                    &[d0, eps],
-                )?[0];
-                wire_with_rank_broadcast(format!("{prefix}.div_sum"), model, div(), &[x, d])?[0]
-            }
-            NormKind::L2 => {
-                // inv = rsqrt(max(reduce_sum(square(x), axis), eps)); y = x * inv
-                let x2 = model.wire_node(format!("{prefix}.square"), square(), &[x])?;
-                let ss0 = model.wire_node(
-                    format!("{prefix}.sum_sq"),
-                    Reduce { axes: tvec![axis], reducer: Reducer::Sum },
-                    &x2,
-                )?[0];
-                let ss = wire_with_rank_broadcast(
-                    format!("{prefix}.clamp_l2"),
-                    model,
-                    max(),
-                    &[ss0, eps],
-                )?[0];
-                let inv = model.wire_node(format!("{prefix}.rsqrt"), rsqrt(), &[ss])?[0];
-                wire_with_rank_broadcast(format!("{prefix}.mul_invnorm"), model, mul(), &[x, inv])?
-                    [0]
-            }
+        // Use the OPL version for the core normalizer computation
+        let kind_opl = match self.kind {
+            NormKind::Max => tract_onnx_opl::ml::normalizer::NormKind::Max,
+            NormKind::L1 => tract_onnx_opl::ml::normalizer::NormKind::L1,
+            NormKind::L2 => tract_onnx_opl::ml::normalizer::NormKind::L2,
         };
 
-        Ok(tvec!(y))
+        let y = model.wire_node(
+            format!("{prefix}.normalizer"),
+            tract_onnx_opl::ml::normalizer::Normalizer { kind: kind_opl },
+            inputs,
+        )?;
+
+        Ok(tvec!(y[0]))
     }
 
     fn nboutputs(&self) -> TractResult<usize> {

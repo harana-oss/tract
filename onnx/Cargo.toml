@@ -39,7 +39,7 @@ criterion.workspace = true
 ureq = { version = "2", default-features = true }
 
 [[bench]]
-name = "linear_regressor"
+name = "linear_classifier"
 harness = false
 
 # [build-dependencies]

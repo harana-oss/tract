@@ -57,7 +57,7 @@ fn bench_linear_classifier(c: &mut Criterion) {
     // Pre-generate random input tensors
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
     let input_tensors: Arc<Vec<Tensor>> = Arc::new(
-        (0..281_539)
+        (0..500_000)
             .map(|_| {
                 let sample: Vec<f32> =
                     (0..num_features).map(|_| rng.gen_range(-30.0f32..30.0f32)).collect();
@@ -75,7 +75,7 @@ fn bench_linear_classifier(c: &mut Criterion) {
             b.iter_custom(|_| {
                 let start = Instant::now();
 
-                (0..281_539usize).into_par_iter().for_each(|i| {
+                (0..500_000usize).into_par_iter().for_each(|i| {
                     let runnable = Arc::clone(&runnable);
                     let input_val = tensors[i].clone().into_tvalue();
                     let _ = runnable.run(tvec!(input_val)).unwrap();

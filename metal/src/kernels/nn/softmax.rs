@@ -41,6 +41,19 @@ impl Softmax {
         stream.retain_tensor(input);
         stream.retain_tensor(output);
 
+        log::info!(
+            ">>>> Softmax dispatch_eval input dt: {:?}, shape: {:?}, axis: {}",
+            input.datum_type(),
+            input.shape(),
+            axis
+        );
+        ensure!(Self::is_supported_dt(input.datum_type()));
+        ensure!(
+            input.shape().len() >= 2,
+            "Softmax requires input rank >= 2, got {}",
+            input.shape().len()
+        );
+
         ensure!(output.shape() == input.shape());
         ensure!(output.datum_type() == input.datum_type());
 

@@ -1,142 +1,69 @@
 use crate::model::{OnnxOpRegister, ParsingContext};
 use crate::pb::NodeProto;
+use crate::pb_helpers::*;
 use tract_hir::internal::*;
 use tract_hir::ops::array::TypedConcat;
-use tract_hir::tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
-use tract_onnx_opl::ml::*;
+use tract_hir::ops::nn::LayerSoftmax;
+
+// Import types from OPL to avoid duplication
+pub use tract_onnx_opl::ml::linear_classifier::{PostTransformLC, parse_post_transform};
 
 pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("LinearClassifier", linear_classifier);
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PostTransform {
-    Softmax,
-    Logistic,
-}
-
-pub fn parse_post_transform(s: &str) -> TractResult<Option<PostTransform>> {
-    match s {
-        "NONE" => Ok(None),
-        "SOFTMAX" => Ok(Some(PostTransform::Softmax)),
-        "LOGISTIC" => Ok(Some(PostTransform::Logistic)),
-        "PROBIT" | "SOFTMAX_ZERO" => bail!("PROBIT and SOFTMAX_ZERO unsupported"),
-        _ => bail!("Invalid post transform: {}", s),
+fn parse_labels(node: &NodeProto) -> TractResult<Arc<Tensor>> {
+    if let Some(strings) = node.get_attr_opt_tvec::<&str>("classlabels_strings")? {
+        Ok(rctensor1(&strings.iter().map(|s| s.to_string()).collect::<Vec<String>>()))
+    } else if let Some(ints) = node.get_attr_opt_slice::<i64>("classlabels_ints")? {
+        Ok(rctensor1(ints))
+    } else {
+        bail!("one of classlabels_strings or classlabels_ints must be set")
     }
-}
-
-fn parse_class_data(node: &NodeProto) -> TractResult<Arc<Tensor>> {
-    let ints = node.get_attr_opt_slice::<i64>("classlabels_ints")?;
-    let strs = node.get_attr_opt_tvec::<&str>("classlabels_strings")?;
-    match (ints, strs) {
-        (Some(n), None) => Ok(rctensor1(n)),
-        (None, Some(n)) => Ok(rctensor1(&n.iter().map(|d| d.to_string()).collect::<Vec<_>>())),
-        (None, None) => bail!("cannot find neither 'classlabels_ints' not 'classlabels_strings'"),
-        (Some(_), Some(_)) => {
-            bail!("only one of 'classlabels_ints' and 'classlabels_strings' can be set")
-        }
-    }
-}
-
-#[derive(Debug, Clone, Hash)]
-pub struct LinearClassifier {
-    pub class_labels: Arc<Tensor>,
-    pub coefficients: Arc<Tensor>,
-    pub intercepts: Option<Arc<Tensor>>, 
-    pub post_transform: Option<PostTransform>,
-    pub binary_result_layout: bool,
-    pub num_models: usize,
 }
 
 fn linear_classifier(
     _ctx: &ParsingContext,
     node: &NodeProto,
 ) -> TractResult<(Box<dyn InferenceOp>, Vec<String>)> {
-    let class_labels = parse_class_data(node)?;
-    let n_classes = class_labels.len();
+    let labels = parse_labels(node)?;
+
+    let coefs = node.get_attr_tvec::<f32>("coefficients")?;
+    let intercepts = node.get_attr_opt_tvec::<f32>("intercepts")?.unwrap_or(tvec!());
     let multi_class: i64 = node.get_attr_opt("multi_class")?.unwrap_or(0);
-    let raw_coeffs: Vec<f32> = node.get_attr_vec("coefficients")?;
-    node.expect(!raw_coeffs.is_empty(), "coefficients not empty")?;
-
-    // Read intercepts early so we can use their length to disambiguate encoding.
-    let intercepts_raw: Option<Vec<f32>> = node.get_attr_opt_vec("intercepts")?;
-
-    // Decide number of models E' and layout.
-    let (e_prime, binary_result_layout) = match intercepts_raw.as_ref() {
-        // If intercepts are provided, prefer using their count as number of models when compatible
-        Some(v) => {
-            node.expect(
-                raw_coeffs.len() % v.len() == 0,
-                "coefficients length must be a multiple of intercepts length",
-            )?;
-            let e_prime = v.len();
-            let binary = n_classes == 2 && e_prime == 1 && multi_class == 0;
-            (e_prime, binary)
-        }
-        // No intercepts provided: fall back to explicit binary flag or divisibility heuristic.
-        None if n_classes == 2 && multi_class == 0 => (1, true),
-        None if raw_coeffs.len() % n_classes == 0 => (n_classes, false),
-        None => bail!(
-            "coefficients length {} not compatible with number of classes {}",
-            raw_coeffs.len(),
-            n_classes
-        ),
-    };
-
-    // Coefficients must split evenly across models.
-    node.expect(
-        raw_coeffs.len() % e_prime == 0,
-        "coefficients length must be a multiple of number of models",
-    )?;
-
-    // Additional validation to match outputs and labels semantics similar to ORT
-    if binary_result_layout {
-        node.expect(
-            n_classes == 2,
-            "binary result layout requires exactly 2 class labels",
-        )?;
-    } else {
-        node.expect(
-            n_classes == e_prime,
-            "class labels length must match number of models when not using binary single-model layout",
-        )?;
-    }
-
-    let c = raw_coeffs.len() / e_prime;
-    // Build as [E', C], then transpose to contiguous [C, E'] for better locality and to avoid
-    // runtime transpose. This also enables SGEMV fast-path when E'==1.
-    let coeffs_ec = tensor1(&raw_coeffs).into_shape(&[e_prime, c])?;
-    let coefficients = coeffs_ec.permute_axes(&[1, 0])?.into_arc_tensor();
-
-    let intercepts = match intercepts_raw {
-        Some(v) => {
-            node.expect(v.len() == e_prime, "intercepts length should match number of models")?;
-            Some(rctensor1(&v))
-        }
-        None => None,
-    };
-
-    let post_transform =
-        node.get_attr_opt("post_transform")?.map(parse_post_transform).transpose()?.unwrap_or(None);
+    let post_t = parse_post_transform(node.get_attr_opt("post_transform")?.unwrap_or("NONE"))?;
 
     Ok((
         expand(LinearClassifier {
-            class_labels,
-            coefficients,
-            intercepts,
-            post_transform,
-            binary_result_layout,
-            num_models: e_prime,
+            labels,
+            coefficients: rctensor1(&coefs),
+            intercepts: if intercepts.is_empty() { None } else { Some(rctensor1(&intercepts)) },
+            multi_class: multi_class as i32,
+            post_transform: post_t,
         }),
         vec![],
     ))
 }
 
+#[derive(Debug, Clone, Hash)]
+pub struct LinearClassifier {
+    pub labels: Arc<Tensor>,
+    pub coefficients: Arc<Tensor>, // shape [E*C] or [C] for binary OvR
+    pub intercepts: Option<Arc<Tensor>>, // shape [E] or [1]
+    pub multi_class: i32,          // 0 OvR, 1 multinomial
+    pub post_transform: PostTransformLC,
+}
+
 impl Expansion for LinearClassifier {
-    fn name(&self) -> StaticName {
+    fn name(&self) -> std::borrow::Cow<'static, str> {
         "LinearClassifier".into()
     }
-
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec![format!(
+            "multi_class={}, post_transform={:?}",
+            self.multi_class, self.post_transform
+        )])
+    }
     fn rules<'r, 'p: 'r, 's: 'r>(
         &'s self,
         s: &mut Solver<'r>,
@@ -145,188 +72,156 @@ impl Expansion for LinearClassifier {
     ) -> InferenceResult {
         check_input_arity(inputs, 1)?;
         check_output_arity(outputs, 2)?;
-
-        s.equals(&outputs[0].datum_type, self.class_labels.datum_type())?;
-        s.equals(&outputs[1].datum_type, DatumType::F32)?;
-
+        s.equals(&outputs[0].datum_type, self.labels.datum_type())?;
         s.equals(&outputs[0].rank, 1)?;
-        s.equals(&outputs[1].rank, 2)?;
         s.equals(&outputs[0].shape[0], &inputs[0].shape[0])?;
+        s.equals(&outputs[1].datum_type, DatumType::F32)?;
+        s.equals(&outputs[1].rank, 2)?;
         s.equals(&outputs[1].shape[0], &inputs[0].shape[0])?;
-        // Scores second dim depends on layout
-        if self.binary_result_layout {
-            s.equals(&outputs[1].shape[1], 2.to_dim())?;
-        } else {
-            s.equals(&outputs[1].shape[1], (self.num_models as i64).to_dim())?;
-        }
-
+        s.equals(&outputs[1].shape[1], self.labels.len().to_dim())?;
         Ok(())
     }
-
     fn wire(
         &self,
         prefix: &str,
         model: &mut TypedModel,
         inputs: &[OutletId],
     ) -> TractResult<TVec<OutletId>> {
-        use tract_core::ops::nn::*;
-
-        let mut x = inputs[0];
-        if model.outlet_fact(x)?.rank() == 1 {
-            x = model.wire_node(format!("{prefix}.add_batch_axis"), AxisOp::Add(0), &[x])?[0];
-        }
-
-        if model.outlet_fact(x)?.datum_type != f32::datum_type() {
-            x = model.wire_node(
-                format!("{prefix}.to_f32"),
-                tract_core::ops::cast::cast(f32::datum_type()),
-                &[x],
-            )?[0];
-        }
-
-        let w = model.add_const(format!("{prefix}.coefficients"), self.coefficients.clone())?;
-        let mut scores = {
-            model.wire_node(
-                format!("{prefix}.matmul"),
-                PrefixMatMul {
-                    transpose_a: false,
-                    transpose_b: false,
-                    transpose_c: false,
-                    quantize_output: None,
-                },
-                [x, w].as_ref(),
-            )?
-        };
-
-        if let Some(intercepts) = self.intercepts.as_deref() {
-            let bias = intercepts.clone().broadcast_into_rank(2)?.into_arc_tensor();
-            let bias = model.add_const(format!("{prefix}.intercepts"), bias)?;
-            scores = model.wire_node(
-                format!("{prefix}.add_bias"),
-                tract_core::ops::math::add(),
-                &[scores[0], bias],
-            )?;
-        }
-
-        // Build final scores following ONNX Runtime semantics.
-        let final_scores = if self.binary_result_layout {
-            match self.post_transform {
-                None => {
-                    // logits [-s, s]
-                    let m1 = model.add_const(format!("{prefix}.m1"), rctensor2(&[[-1f32]]))?;
-                    let neg = model.wire_node(
-                        format!("{prefix}.binary.neg"),
-                        tract_core::ops::math::mul(),
-                        &[scores[0], m1],
-                    )?;
-                    model.wire_node(
-                        format!("{prefix}.binary.concat"),
-                        TypedConcat::new(1),
-                        &[neg[0], scores[0]],
-                    )?
-                }
-                Some(PostTransform::Logistic) => {
-                    // probabilities [1 - sigmoid(s), sigmoid(s)]
-                    let p = model.wire_node(
-                        format!("{prefix}.logistic"),
-                        tract_core::ops::nn::sigmoid(),
-                        &scores,
-                    )?;
-                    let one = model.add_const(prefix.to_string() + ".one", rctensor2(&[[1f32]]))?;
-                    let complement = model.wire_node(
-                        format!("{prefix}.binary.complement"),
-                        tract_core::ops::math::sub(),
-                        &[one, p[0]],
-                    )?;
-                    model.wire_node(
-                        format!("{prefix}.binary.concat"),
-                        TypedConcat::new(1),
-                        &[complement[0], p[0]],
-                    )?
-                }
-                Some(PostTransform::Softmax) => {
-                    // softmax([-s, s])
-                    let m1 = model.add_const(format!("{prefix}.m1"), rctensor2(&[[-1f32]]))?;
-                    let neg = model.wire_node(
-                        format!("{prefix}.binary.neg"),
-                        tract_core::ops::math::mul(),
-                        &[scores[0], m1],
-                    )?;
-                    let logits2 = model.wire_node(
-                        format!("{prefix}.binary.logits2"),
-                        TypedConcat::new(1),
-                        &[neg[0], scores[0]],
-                    )?;
-                    model.wire_node(
-                        format!("{prefix}.softmax"),
-                        tract_core::ops::nn::Softmax {
-                            axes: tvec![1],
-                            quant_output_dt: None,
-                            kind: tract_core::ops::nn::SoftmaxKind::Softmax(
-                                tract_core::ops::nn::SoftmaxExp::Libc,
-                            ),
-                        },
-                        &logits2,
-                    )?
-                }
-            }
+        // Precompute metadata to satisfy updated OPL LinearClassifierData struct
+        let e = self.labels.len();
+        let coef_slice = self.coefficients.as_slice::<f32>()?;
+        let total = coef_slice.len();
+        let (eff_e, feat_c) = if total % e == 0 {
+            (e, total / e)
+        } else if e == 2 {
+            (1, total)
         } else {
-            // multiclass: apply transform directly on [N, E']
-            let mut tmp = scores.clone();
-            match self.post_transform {
-                None => {}
-                Some(PostTransform::Softmax) => {
-                    tmp = model.wire_node(
-                        format!("{prefix}.softmax"),
-                        tract_core::ops::nn::Softmax {
-                            axes: tvec![1],
-                            quant_output_dt: None,
-                            kind: tract_core::ops::nn::SoftmaxKind::Softmax(
-                                tract_core::ops::nn::SoftmaxExp::Libc,
-                            ),
-                        },
-                        &tmp,
-                    )?;
-                }
-                Some(PostTransform::Logistic) => {
-                    tmp = model.wire_node(
-                        format!("{prefix}.logistic"),
-                        tract_core::ops::nn::sigmoid(),
-                        &tmp,
-                    )?;
-                }
-            }
-            tmp
+            bail!(
+                "Cannot infer (classes, features) from coefficients length {} and labels {}",
+                total,
+                e
+            )
         };
-
-        let winners = model.wire_node(
-            format!("{prefix}.argmax"),
-            tract_core::ops::nn::Reduce::new(tvec!(1), tract_core::ops::nn::Reducer::ArgMax(false)),
-            &final_scores,
+        if eff_e * feat_c != total {
+            bail!("Inconsistent coefficients size eff_e={} feat_c={} len={}", eff_e, feat_c, total);
+        }
+        let mut transposed = vec![0f32; total];
+        for cls in 0..eff_e {
+            for f in 0..feat_c {
+                transposed[f * eff_e + cls] = coef_slice[cls * feat_c + f];
+            }
+        }
+        let coefficients_raw: Arc<[f32]> = coef_slice.to_vec().into();
+        let coefficients_t: Arc<[f32]> = transposed.into();
+        let data = tract_onnx_opl::ml::linear_classifier::LinearClassifierData {
+            labels: self.labels.clone(),
+            coefficients: self.coefficients.clone(),
+            intercepts: self.intercepts.clone(),
+            eff_e,
+            feat_c,
+            coefficients_raw,
+            coefficients_t,
+        };
+        let outputs = model.wire_node(
+            format!("{prefix}"),
+            tract_onnx_opl::ml::linear_classifier::LinearClassifier {
+                data,
+                multi_class: self.multi_class as i64,
+                post_transform: self.post_transform,
+            },
+            inputs,
         )?;
-        let reduced = model.wire_node(
-            format!("{prefix}.rm_axis"),
-            tract_core::ops::change_axes::AxisOp::Rm(1),
-            &winners,
-        )?;
-        let casted = model.wire_node(
-            format!("{prefix}.casted"),
-            tract_core::ops::cast::cast(i32::datum_type()),
-            &reduced,
-        )?;
-        let labels = model.wire_node(
-            format!("{prefix}.labels"),
-            DirectLookup::new(
-                self.class_labels.clone(),
-                Tensor::zero_dt(self.class_labels.datum_type(), &[])?.into_arc_tensor(),
-            )?,
-            &casted,
-        )?[0];
-
-        Ok(tvec!(labels, final_scores[0]))
+        Ok(tvec!(outputs[0], outputs[1]))
     }
-
     fn nboutputs(&self) -> TractResult<usize> {
         Ok(2)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sigmoid_scalar(x: f32) -> f32 {
+        1.0 / (1.0 + (-x).exp())
+    }
+
+    #[test]
+    fn multiclass_none_int_labels() {
+        // 3 classes, 2 features
+        // class0: [1, 0], class1: [0, 1], class2: [-1, -1]
+        let labels = rctensor1(&[10i64, 20, 30]);
+        let coefs = rctensor1(&[1f32, 0., 0., 1., -1., -1.]);
+        let op = LinearClassifier {
+            labels: labels.clone(),
+            coefficients: coefs,
+            intercepts: None,
+            multi_class: 1,
+            post_transform: PostTransformLC::None,
+        };
+        let x = tensor2(&[[1f32, 0.], [0., 1.]]);
+        let outputs = expand(op).eval(tvec!(x.into_tvalue())).unwrap();
+        let y = outputs[0].clone().into_tensor();
+        let z = outputs[1].clone().into_tensor();
+
+        // Y should map to labels 10 then 20
+        assert_eq!(y.as_slice::<i64>().unwrap(), &[10i64, 20i64]);
+
+        // Z should be raw scores [[1,0,-1],[0,1,-1]]
+        let expected = tensor2(&[[1f32, 0., -1.], [0., 1., -1.]]);
+        expected.close_enough(&z, true).unwrap();
+    }
+
+    #[test]
+    fn binary_none_singlevec_string_labels() {
+        // 2 classes with single-vector coefficients, NONE post-transform
+        // s = 2*x0 - 1*x1; Z = [-s, s]
+        let labels = rctensor1(&["no".to_string(), "yes".to_string()]);
+        let coefs = rctensor1(&[2f32, -1.0]);
+        let op = LinearClassifier {
+            labels: labels.clone(),
+            coefficients: coefs,
+            intercepts: None,
+            multi_class: 0,
+            post_transform: PostTransformLC::None,
+        };
+        let x = tensor2(&[[1f32, 0.], [0., 3.]]);
+        let outputs = expand(op).eval(tvec!(x.into_tvalue())).unwrap();
+        let y = outputs[0].clone().into_tensor();
+        let z = outputs[1].clone().into_tensor();
+
+        // First row s=2 -> class 1 ("yes"), second row s=-3 -> class 0 ("no")
+        let y_vals = y.as_slice::<String>().unwrap();
+        assert_eq!(y_vals, &["yes".to_string(), "no".to_string()]);
+
+        // Z should be [[-2, 2], [3, -3]]
+        let expected = tensor2(&[[-2f32, 2.], [3., -3.]]);
+        expected.close_enough(&z, true).unwrap();
+    }
+
+    #[test]
+    fn binary_logistic_rank1_input() {
+        // 2 classes, single feature, logistic post-transform, rank-1 input
+        // s = 1 * x; p = sigmoid(s); Z = [1-p, p]
+        let labels = rctensor1(&[0i64, 1i64]);
+        let coefs = rctensor1(&[1f32]);
+        let op = LinearClassifier {
+            labels: labels.clone(),
+            coefficients: coefs,
+            intercepts: Some(rctensor1(&[0f32])),
+            multi_class: 0,
+            post_transform: PostTransformLC::Logistic,
+        };
+        let x = tensor1(&[2f32]); // rank-1 input should be accepted
+        let outputs = expand(op).eval(tvec!(x.into_tvalue())).unwrap();
+        let y = outputs[0].clone().into_tensor();
+        let z = outputs[1].clone().into_tensor();
+
+        // Argmax should be class 1
+        assert_eq!(y.as_slice::<i64>().unwrap(), &[1i64]);
+
+        let p = sigmoid_scalar(2.0);
+        let expected = tensor2(&[[1.0 - p, p]]);
+        expected.close_enough(&z, true).unwrap();
     }
 }

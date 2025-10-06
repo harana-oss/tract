@@ -1,75 +1,62 @@
 use crate::model::{OnnxOpRegister, ParsingContext};
 use crate::pb::NodeProto;
+use crate::pb_helpers::*;
 use tract_hir::internal::*;
-use tract_hir::tract_core::ops::einsum::prefix_matmul::PrefixMatMul;
+
+// Re-export OPL types
+pub use tract_onnx_opl::ml::linear_regressor::{PostTransformLR, parse_post_transform_lr};
 
 pub fn register_all_ops(reg: &mut OnnxOpRegister) {
     reg.insert("LinearRegressor", linear_regressor);
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum PostTransform {
-    Softmax,
-    Logistic,
-}
-
-pub fn parse_post_transform(s: &str) -> TractResult<Option<PostTransform>> {
-    match s {
-        "NONE" => Ok(None),
-        "SOFTMAX" => Ok(Some(PostTransform::Softmax)),
-        "LOGISTIC" => Ok(Some(PostTransform::Logistic)),
-        "PROBIT" | "SOFTMAX_ZERO" => bail!("PROBIT and SOFTMAX_ZERO unsupported"),
-        _ => bail!("Invalid post transform: {}", s),
-    }
-}
-
-#[derive(Debug, Clone, Hash)]
-pub struct LinearRegressor {
-    pub coefficients: Arc<Tensor>,
-    pub intercepts: Option<Arc<Tensor>>,
-    pub post_transform: Option<PostTransform>,
-    pub targets: usize,
 }
 
 fn linear_regressor(
     _ctx: &ParsingContext,
     node: &NodeProto,
 ) -> TractResult<(Box<dyn InferenceOp>, Vec<String>)> {
-    let targets_i64: i64 = node.get_attr_opt("targets")?.unwrap_or(1);
-    node.expect(targets_i64 > 0, "targets must be > 0")?;
-    let targets: usize = usize::try_from(targets_i64)
-        .map_err(|_| format_err!("targets out of range: {}", targets_i64))?;
+    // targets attribute (default 1)
+    let targets: i64 = node.get_attr_opt("targets")?.unwrap_or(1);
+    node.expect(targets > 0, "targets must be > 0")?;
+    let targets: usize =
+        usize::try_from(targets).map_err(|_| format_err!("targets out of range"))?;
 
-    let raw_coeffs: Vec<f32> = node.get_attr_vec("coefficients")?;
-    node.expect(!raw_coeffs.is_empty(), "coefficients not empty")?;
+    // coefficients: flat vector length = targets * features (or features if targets==1)
+    let coefs = node.get_attr_tvec::<f32>("coefficients")?;
+    node.expect(!coefs.is_empty(), "coefficients not empty")?;
+    node.expect(coefs.len() % targets == 0, "coefficients length multiple of targets")?;
 
-    node.expect(
-        raw_coeffs.len() % targets == 0,
-        "coefficients length must be a multiple of targets",
-    )?;
-    let c = raw_coeffs.len() / targets;
+    // optional intercepts: length == targets or 1
+    let intercepts = node.get_attr_opt_tvec::<f32>("intercepts")?.unwrap_or(tvec!());
 
-    let coeffs_tc = tensor1(&raw_coeffs).into_shape(&[targets, c])?;
-    let coefficients = coeffs_tc.permute_axes(&[1, 0])?.into_arc_tensor();
+    // post_transform (NONE by default)
+    let post_t = parse_post_transform_lr(node.get_attr_opt("post_transform")?.unwrap_or("NONE"))?;
 
-    let intercepts: Option<Vec<f32>> = node.get_attr_opt_vec("intercepts")?;
-    let intercepts = match intercepts {
-        Some(v) => {
-            node.expect(v.len() == targets, "intercepts length matches number of targets")?;
-            Some(rctensor1(&v))
-        }
-        None => None,
-    };
-
-    let post_transform =
-        node.get_attr_opt("post_transform")?.map(parse_post_transform).transpose()?.unwrap_or(None);
-
-    Ok((expand(LinearRegressor { coefficients, intercepts, post_transform, targets }), vec![]))
+    Ok((
+        expand(LinearRegressorBridge {
+            coefficients: rctensor1(&coefs),
+            intercepts: if intercepts.is_empty() { None } else { Some(rctensor1(&intercepts)) },
+            targets,
+            post_transform: post_t,
+        }),
+        vec![],
+    ))
 }
 
-impl Expansion for LinearRegressor {
+#[derive(Debug, Clone, Hash)]
+pub struct LinearRegressorBridge {
+    pub coefficients: Arc<Tensor>,       // flat tensor (targets * features)
+    pub intercepts: Option<Arc<Tensor>>, // shape [targets] or [1]
+    pub targets: usize,
+    pub post_transform: PostTransformLR,
+}
+
+impl Expansion for LinearRegressorBridge {
     fn name(&self) -> StaticName {
         "LinearRegressor".into()
+    }
+
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec![format!("targets={}, post_transform={:?}", self.targets, self.post_transform)])
     }
 
     fn rules<'r, 'p: 'r, 's: 'r>(
@@ -80,11 +67,10 @@ impl Expansion for LinearRegressor {
     ) -> InferenceResult {
         check_input_arity(inputs, 1)?;
         check_output_arity(outputs, 1)?;
-
         s.equals(&outputs[0].datum_type, DatumType::F32)?;
         s.equals(&outputs[0].rank, 2)?;
-        s.equals(&outputs[0].shape[0], &inputs[0].shape[0])?;
-        s.equals(&outputs[0].shape[1], self.targets.to_dim())?;
+        s.equals(&outputs[0].shape[0], &inputs[0].shape[0])?; // batch dimension
+        s.equals(&outputs[0].shape[1], self.targets.to_dim())?; // targets
         Ok(())
     }
 
@@ -94,67 +80,21 @@ impl Expansion for LinearRegressor {
         model: &mut TypedModel,
         inputs: &[OutletId],
     ) -> TractResult<TVec<OutletId>> {
-        use tract_core::ops::nn::*;
-
-        let mut x = inputs[0];
-        if model.outlet_fact(x)?.rank() == 1 {
-            x = model.wire_node(format!("{prefix}.add_batch_axis"), AxisOp::Add(0), &[x])?[0];
-        }
-        if model.outlet_fact(x)?.datum_type != f32::datum_type() {
-            x = model.wire_node(
-                format!("{prefix}.to_f32"),
-                tract_core::ops::cast::cast(f32::datum_type()),
-                &[x],
-            )?[0];
-        }
-
-        let w = model.add_const(format!("{prefix}.coefficients"), self.coefficients.clone())?;
-        let mut y = model.wire_node(
-            format!("{prefix}.matmul"),
-            PrefixMatMul {
-                transpose_a: false,
-                transpose_b: false,
-                transpose_c: false,
-                quantize_output: None,
-            },
-            [x, w].as_ref(),
+        // Build OPL data structure (computes metadata, transposed buffers, etc.)
+        let data = tract_onnx_opl::ml::linear_regressor::LinearRegressorData::new(
+            self.coefficients.clone(),
+            self.intercepts.clone(),
+            self.targets,
         )?;
-
-        if let Some(intercepts) = self.intercepts.as_deref() {
-            let bias = intercepts.clone().broadcast_into_rank(2)?.into_arc_tensor();
-            let bias = model.add_const(format!("{prefix}.intercepts"), bias)?;
-            y = model.wire_node(
-                format!("{prefix}.add_bias"),
-                tract_core::ops::math::add(),
-                &[y[0], bias],
-            )?;
-        }
-
-        match self.post_transform {
-            None => {}
-            Some(PostTransform::Softmax) => {
-                y = model.wire_node(
-                    format!("{prefix}.softmax"),
-                    tract_core::ops::nn::Softmax {
-                        axes: tvec![1],
-                        quant_output_dt: None,
-                        kind: tract_core::ops::nn::SoftmaxKind::Softmax(
-                            tract_core::ops::nn::SoftmaxExp::Libc,
-                        ),
-                    },
-                    &y,
-                )?;
-            }
-            Some(PostTransform::Logistic) => {
-                y = model.wire_node(
-                    format!("{prefix}.logistic"),
-                    tract_core::ops::nn::sigmoid(),
-                    &y,
-                )?;
-            }
-        }
-
-        Ok(tvec!(y[0]))
+        let outputs = model.wire_node(
+            format!("{prefix}"),
+            tract_onnx_opl::ml::linear_regressor::LinearRegressorOp {
+                data,
+                post_transform: self.post_transform,
+            },
+            inputs,
+        )?;
+        Ok(tvec!(outputs[0]))
     }
 
     fn nboutputs(&self) -> TractResult<usize> {
