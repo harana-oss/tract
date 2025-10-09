@@ -1,9 +1,6 @@
 use crate::model::{OnnxOpRegister, ParsingContext};
 use crate::pb::NodeProto;
-use crate::pb_helpers::*;
 use tract_hir::internal::*;
-use tract_hir::ops::array::TypedConcat;
-use tract_hir::ops::nn::LayerSoftmax;
 
 // Import types from OPL to avoid duplication
 pub use tract_onnx_opl::ml::linear_classifier::{PostTransformLC, parse_post_transform};
@@ -87,7 +84,6 @@ impl Expansion for LinearClassifier {
         model: &mut TypedModel,
         inputs: &[OutletId],
     ) -> TractResult<TVec<OutletId>> {
-        // Precompute metadata to satisfy updated OPL LinearClassifierData struct
         let e = self.labels.len();
         let coef_slice = self.coefficients.as_slice::<f32>()?;
         let total = coef_slice.len();

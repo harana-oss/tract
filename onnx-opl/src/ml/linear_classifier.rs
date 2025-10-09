@@ -4,7 +4,6 @@ use std::hash::{Hash, Hasher};
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
 
-// Small reusable per-thread buffer for tiny softmax temps (avoids allocs for e<=8)
 thread_local! {
     static SOFTMAX_TMP: RefCell<[f32; 8]> = RefCell::new([0.0; 8]);
 }
@@ -39,7 +38,7 @@ pub enum PostTransformLC {
 #[derive(Debug, Clone)]
 pub struct LinearClassifierData {
     pub labels: Arc<Tensor>,
-    pub coefficients: Arc<Tensor>, // original tensor (kept for dump/serialization)
+    pub coefficients: Arc<Tensor>,
     pub intercepts: Option<Arc<Tensor>>,
     // Pre-computed metadata / optimized storage
     pub eff_e: usize,  // effective number of weight vectors (1 for compact binary)
@@ -50,7 +49,6 @@ pub struct LinearClassifierData {
 
 impl Hash for LinearClassifierData {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        // Hash only canonical sources; derived buffers are excluded.
         self.labels.hash(state);
         self.coefficients.hash(state);
         self.intercepts.hash(state);

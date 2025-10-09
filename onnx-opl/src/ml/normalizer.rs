@@ -11,7 +11,7 @@ const NEON_SMALL_FAST_C: usize = 128;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
-        "Normalizer",
+        "tract_onnx_ml_normalizer",
         &parameters(),
         &[("output", TypeName::Scalar.tensor())],
         load,
