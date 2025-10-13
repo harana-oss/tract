@@ -488,9 +488,25 @@ where
     }
 
     fn resolve(state: &mut SessionState, expression: &TDim, provided: i64) -> TractResult<()> {
-        // Fast-path: if already fully concrete, just compare and return
-        let expected = expression.eval(&state.resolved_symbols);
-        if let Ok(x) = expected.to_i64() {
+        // 0) Ultra-fast path: expression is a single unresolved symbol -> bind directly
+        {
+            use crate::internal::TDim::*;
+            if let Sym(sym) = expression {
+                if state.resolved_symbols.get(sym).is_none() {
+                    state.resolved_symbols.set(sym, provided);
+                    if state.scenario.is_none() {
+                        let scope = sym.scope().with_context(|| format!(
+                            "Symbol {sym:?} points to an invalid (dead ?) SymbolScope. Make sure to create symbols using the model-managed SymbolScope."
+                        ))?;
+                        state.scenario = scope.guess_scenario(&state.resolved_symbols)?;
+                    }
+                    return Ok(());
+                }
+            }
+        }
+
+        // 1) Fast-path: attempt numeric evaluation without allocating a new TDim
+        if let Ok(x) = expression.eval_to_i64(&state.resolved_symbols) {
             ensure!(
                 x == provided,
                 "Clashing resolution for expression. {expression}={x} != {provided}. ({state:?})"
@@ -498,9 +514,50 @@ where
             return Ok(());
         }
 
-        // Only when exactly one symbol is present can we solve directly
-        if expected.symbols().len() == 1 {
-            let sym = expected.symbols().into_iter().next().unwrap();
+        // 2) If exactly one unresolved symbol remains (w.r.t. current symbol values), try to solve
+        //    Detect this without building HashSets or allocating a new TDim when possible.
+        fn single_unresolved_symbol(
+            expr: &TDim,
+            values: &SymbolValues,
+        ) -> Option<Symbol> {
+            use crate::internal::TDim::*;
+            fn walk(e: &TDim, values: &SymbolValues, acc: &mut Option<Symbol>) -> bool {
+                match e {
+                    Val(_) => true,
+                    Sym(s) => {
+                        // Resolved symbols are considered concrete
+                        if values.get(s).is_some() {
+                            true
+                        } else {
+                            match acc {
+                                None => {
+                                    *acc = Some(s.clone());
+                                    true
+                                }
+                                Some(seen) if seen == s => true,
+                                Some(_) => false, // found a second distinct symbol
+                            }
+                        }
+                    }
+                    Add(ts) | Mul(ts) | Broadcast(ts) | Min(ts) | Max(ts) => {
+                        for t in ts {
+                            if !walk(t, values, acc) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    MulInt(_, a) => walk(a, values, acc),
+                    Div(a, _) => walk(a, values, acc),
+                }
+            }
+            let mut only: Option<Symbol> = None;
+            if walk(expr, values, &mut only) { only } else { None }
+        }
+
+        if let Some(sym) = single_unresolved_symbol(expression, &state.resolved_symbols) {
+            // Substitute known symbols once to shrink the expression to a single unknown symbol
+            let expected = expression.eval(&state.resolved_symbols);
             if let Some(v) = solve_for(&sym, &expected, &provided.to_dim()) {
                 debug!("Determined symbol {sym}={v}");
                 let val = v.to_i64()?;
