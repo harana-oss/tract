@@ -82,6 +82,11 @@ where
     has_unresolved_symbols: bool,
     // For each node, for each output, list indices of dims that contain symbols (precomputed)
     symbolic_output_dims: Vec<Vec<Vec<usize>>>,
+    // Cache typed output facts to avoid repeated conversions during eval
+    typed_output_facts: Vec<Vec<Option<TypedFact>>>,
+    // For each node, for each output, for each dim index, if the abstract dim contains
+    // exactly one symbol, store it to skip scanning at runtime; otherwise None.
+    single_symbolic_output_syms: Vec<Vec<Vec<Option<Symbol>>>>,
     executor: Option<Executor>,
     session_handler: Option<Arc<dyn SessionStateHandler + 'static>>,
     _casper: PhantomData<(F, O)>,
@@ -156,8 +161,18 @@ where
         // Precompute which output dims are symbolic to skip work at runtime
         let mut symbolic_output_dims: Vec<Vec<Vec<usize>>> =
             vec![vec![]; model.borrow().nodes.len()];
+        // Cache typed facts for outputs to avoid repeated conversions
+        let mut typed_output_facts: Vec<Vec<Option<TypedFact>>> =
+            vec![vec![]; model.borrow().nodes.len()];
+        // Precompute single-symbol info per abstract output dim
+        let mut single_symbolic_output_syms: Vec<Vec<Vec<Option<Symbol>>>> =
+            vec![vec![]; model.borrow().nodes.len()];
         for node in &model.borrow().nodes {
             let mut node_outputs: Vec<Vec<usize>> = Vec::with_capacity(node.outputs.len());
+            let mut node_typed_facts: Vec<Option<TypedFact>> =
+                Vec::with_capacity(node.outputs.len());
+            let mut node_single_syms: Vec<Vec<Option<Symbol>>> =
+                Vec::with_capacity(node.outputs.len());
             for output in &node.outputs {
                 if let Ok(fact) = output.fact.to_typed_fact() {
                     // Track all symbols for global flag
@@ -170,11 +185,30 @@ where
                         .filter_map(|(ix, d)| if d.symbols().len() > 0 { Some(ix) } else { None })
                         .collect::<Vec<_>>();
                     node_outputs.push(dims_with_symbols);
+                    // Build single-symbol map for each dim (None if 0 or >1 symbols)
+                    let mut per_dim_syms: Vec<Option<Symbol>> =
+                        Vec::with_capacity(fact.shape.iter().count());
+                    for d in fact.shape.iter() {
+                        let syms = d.symbols();
+                        if syms.len() == 1 {
+                            // Safe to unwrap: len() == 1
+                            let s = syms.iter().next().unwrap().clone();
+                            per_dim_syms.push(Some(s));
+                        } else {
+                            per_dim_syms.push(None);
+                        }
+                    }
+                    node_single_syms.push(per_dim_syms);
+                    node_typed_facts.push(Some(fact.into_owned()));
                 } else {
                     node_outputs.push(Vec::new());
+                    node_single_syms.push(Vec::new());
+                    node_typed_facts.push(None);
                 }
             }
             symbolic_output_dims[node.id] = node_outputs;
+            single_symbolic_output_syms[node.id] = node_single_syms;
+            typed_output_facts[node.id] = node_typed_facts;
         }
         Ok(SimplePlan {
             model,
@@ -183,6 +217,8 @@ where
             outputs: outputs.to_vec(),
             has_unresolved_symbols: !symbols.is_empty(),
             symbolic_output_dims,
+            typed_output_facts,
+            single_symbolic_output_syms,
             _casper: PhantomData,
             executor: options.executor.clone(),
             session_handler: None,
@@ -373,11 +409,11 @@ where
             for (step, n) in plan.order.iter().enumerate() {
                 let node = model.node(*n);
                 trace!("Running step {step}, node {node}");
-                let mut inputs: TVec<TValue> = tvec![];
+                let mut inputs: TVec<TValue> = TVec::with_capacity(node.inputs.len());
                 for i in &node.inputs {
                     trace!("  use input {i:?}");
-                    let prec_node = model.node(i.node);
                     let prec = self.values[i.node].as_ref().ok_or_else(|| {
+                        let prec_node = model.node(i.node);
                         format_err!("Computing {}, precursor {} not done:", node, prec_node)
                     })?;
                     inputs.push(prec[i.slot].clone())
@@ -422,17 +458,44 @@ where
                 if plan.has_unresolved_symbols {
                     // Only attempt to resolve dims that are known to contain symbols for this node
                     let symbolic = &plan.symbolic_output_dims[node.id];
-                    for ((o, v), dims) in node.outputs.iter().zip(vs.iter()).zip(symbolic.iter()) {
+                    let single_syms = &plan.single_symbolic_output_syms[node.id];
+                    let typed_facts = &plan.typed_output_facts[node.id];
+                    for out_ix in 0..node.outputs.len() {
+                        let dims = &symbolic[out_ix];
                         if dims.is_empty() {
                             continue;
                         }
-                        if let Ok(f) = o.fact.to_typed_fact() {
-                            let vshape = v.shape();
+                        if let Some(f) = &typed_facts[out_ix] {
+                            let vshape = vs[out_ix].shape();
+                            let syms_per_dim = &single_syms[out_ix];
                             for &ix in dims {
                                 // Safety: dims were computed from the same fact shape length
                                 let dim_abstract = &f.shape[ix];
                                 let dim_concrete = vshape[ix] as i64;
-                                Self::resolve(&mut self.session_state, dim_abstract, dim_concrete)?;
+                                // If we know there's exactly one symbol syntactically, skip the
+                                // dynamic scan for the single unresolved symbol.
+                                if let Some(sym) = syms_per_dim.get(ix).and_then(|s| s.as_ref()) {
+                                    if self.session_state.resolved_symbols.get(sym).is_none() {
+                                        let expected = dim_abstract.eval(&self.session_state.resolved_symbols);
+                                        if let Some(v) = solve_for(sym, &expected, &dim_concrete.to_dim()) {
+                                            let val = v.to_i64()?;
+                                            self.session_state.resolved_symbols.set(sym, val);
+                                            if self.session_state.scenario.is_none() {
+                                                let scope = sym.scope().with_context(|| format!(
+                                                    "Symbol {sym:?} points to an invalid (dead ?) SymbolScope. Make sure to create symbols using the model-managed SymbolScope."
+                                                ))?;
+                                                self.session_state.scenario = scope.guess_scenario(&self.session_state.resolved_symbols)?;
+                                            }
+                                        } else {
+                                            // Fall back to generic resolver if we can't solve
+                                            Self::resolve(&mut self.session_state, dim_abstract, dim_concrete)?;
+                                        }
+                                    }
+                                } else {
+                                    // Multiple symbols in expression: use generic resolver that can
+                                    // detect if only one remains unresolved at this point.
+                                    Self::resolve(&mut self.session_state, dim_abstract, dim_concrete)?;
+                                }
                             }
                         }
                     }
@@ -639,7 +702,7 @@ where
         let plan = plan.borrow();
         let nodes = plan.model().nodes();
         let node = &nodes[node];
-        let mut inputs: TVec<TValue> = tvec![];
+        let mut inputs: TVec<TValue> = TVec::with_capacity(node.inputs.len());
         for i in &node.inputs {
             let prec_node = &nodes[i.node];
             let prec = values[i.node].as_ref().ok_or_else(|| {
@@ -685,7 +748,7 @@ where
                     let _ = self.compute_recursively(i)?;
                 }
             }
-            let mut inputs: TVec<TValue> = tvec![];
+            let mut inputs: TVec<TValue> = TVec::with_capacity(self.model().nodes()[node].inputs.len());
             {
                 let node = &self.model().nodes()[node];
                 for i in &node.inputs {
