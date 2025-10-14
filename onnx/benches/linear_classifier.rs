@@ -4,7 +4,7 @@ use rand::Rng;
 use rand::SeedableRng;
 use rand_xoshiro::Xoshiro256PlusPlus;
 
-use rayon::prelude::*;
+use par_iter::prelude::*;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,6 +16,7 @@ static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn bench_linear_classifier(c: &mut Criterion) {
     let mut group = c.benchmark_group("onnx_linear_classifier");
+    group.sample_size(10);
 
     let model_path = std::env::var("MODEL_PATH")
         .expect("Set MODEL_PATH to an existing .onnx file containing ai.onnx.ml.LinearClassifier");
@@ -57,7 +58,7 @@ fn bench_linear_classifier(c: &mut Criterion) {
     // Pre-generate random input tensors
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
     let input_tensors: Arc<Vec<Tensor>> = Arc::new(
-        (0..281_539)
+        (0..(15_000))
             .map(|_| {
                 let sample: Vec<f32> =
                     (0..num_features).map(|_| rng.gen_range(-30.0f32..30.0f32)).collect();
@@ -66,19 +67,28 @@ fn bench_linear_classifier(c: &mut Criterion) {
             .collect(),
     );
 
+    // Build the execution plan once; it will be cloned per thread
+    let plan = TypedSimplePlan::new(model.clone()).unwrap();
+
     group.bench_function(
         BenchmarkId::new("load_opt_run_parallel", onnx_path.display().to_string()),
         |b| {
-            let runnable = Arc::new(model.clone().into_runnable().unwrap());
             let tensors = Arc::clone(&input_tensors);
 
             b.iter_custom(|_| {
                 let start = Instant::now();
 
-                (0..281_539usize).into_par_iter().for_each(|i| {
-                    let runnable = Arc::clone(&runnable);
+                (0..15_000).into_par_iter().for_each(|i| {
                     let input_val = tensors[i].clone().into_tvalue();
-                    let _ = runnable.run(tvec!(input_val)).unwrap();
+
+                    let mut state = SimpleState::new(plan.clone()).unwrap();
+                    let mut inputs = TVec::new();
+
+                    for _ in 0..2800 {
+                        inputs.clear();
+                        inputs.push(input_val.clone());
+                        let _ = state.run(inputs.clone()).unwrap();
+                    }
                 });
 
                 start.elapsed()

@@ -516,10 +516,7 @@ where
 
         // 2) If exactly one unresolved symbol remains (w.r.t. current symbol values), try to solve
         //    Detect this without building HashSets or allocating a new TDim when possible.
-        fn single_unresolved_symbol(
-            expr: &TDim,
-            values: &SymbolValues,
-        ) -> Option<Symbol> {
+        fn single_unresolved_symbol(expr: &TDim, values: &SymbolValues) -> Option<Symbol> {
             use crate::internal::TDim::*;
             fn walk(e: &TDim, values: &SymbolValues, acc: &mut Option<Symbol>) -> bool {
                 match e {

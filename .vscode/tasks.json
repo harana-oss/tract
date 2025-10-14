@@ -172,6 +172,16 @@
 				"tract-onnx",
 				"--benches"
 			]
+		},
+		{
+			"label": "cargo check data (bit-set)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
 		}
 	]
 }
