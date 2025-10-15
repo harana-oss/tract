@@ -132,6 +132,17 @@ impl Expansion for LinearClassifier {
             feat_c,
             coefficients_raw,
             coefficients_t,
+            labels_i64: match self.labels.datum_type() {
+                DatumType::I64 => Some(self.labels.as_slice::<i64>()?.to_vec().into()),
+                _ => None,
+            },
+            labels_str: match self.labels.datum_type() {
+                DatumType::String => Some(self.labels.as_slice::<String>()?.to_vec().into()),
+                _ => None,
+            },
+            packed_tiled: None,
+            prefer_transposed: eff_e >= 4 && feat_c >= 16,
+            m_out: if eff_e == 1 && e == 2 { 2 } else { eff_e },
             binary_compact,
             bias_scalar,
             intercepts_eff_e,

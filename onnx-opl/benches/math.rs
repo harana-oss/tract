@@ -1,5 +1,6 @@
-use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion, Throughput, black_box};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::prelude::*;
+use std::hint::black_box;
 
 fn bench_dot_and_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("math_neon");
@@ -19,36 +20,54 @@ fn bench_dot_and_matmul(c: &mut Criterion) {
     }
 
     // Matmul row-wise sizes (n rows, c cols, e weight vectors)
-    for &(n, c, e) in &[ (32usize, 64usize, 8usize), (32, 128, 32), (16, 512, 16) ] {
+    for &(n, c, e) in &[(32usize, 64usize, 8usize), (32, 128, 32), (16, 512, 16)] {
         let mut rng = StdRng::seed_from_u64(2);
-        let x: Vec<f32> = (0..n*c).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let w: Vec<f32> = (0..e*c).map(|_| rng.gen_range(-1.0..1.0)).collect();
-        let mut out = vec![0f32; n*e];
-        group.throughput(Throughput::Elements((n*c) as u64));
-        group.bench_with_input(BenchmarkId::new("matmul_rows_contig", format!("{}x{}x{}", n,c,e)), &(n,c,e), |bch, &(n,c,e)| {
-            bch.iter_batched(
-                || black_box(&mut out),
-                |o| unsafe {
-                    tract_onnx_opl::ml::math::matmul_rows_neon_contig(&x, n, c, &w, e, o);
-                    black_box(())
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        let x: Vec<f32> = (0..n * c).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        let w: Vec<f32> = (0..e * c).map(|_| rng.gen_range(-1.0..1.0)).collect();
+        group.throughput(Throughput::Elements((n * c) as u64));
+        group.bench_with_input(
+            BenchmarkId::new("matmul_rows_contig", format!("{}x{}x{}", n, c, e)),
+            &(n, c, e),
+            |bch, &(n, c, e)| {
+                bch.iter_batched(
+                    || vec![0f32; n * e],
+                    |mut out| unsafe {
+                        tract_onnx_opl::ml::math::matmul_rows_neon_contig(
+                            &x, n, c, &w, e, &mut out,
+                        );
+                        black_box(())
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
 
         // Fake strided/gather path: use s0=c, s1=1 but read through pointer
-        group.bench_with_input(BenchmarkId::new("matmul_rows_gather", format!("{}x{}x{}", n,c,e)), &(n,c,e), |bch, &(n,c,e)| {
-            bch.iter_batched(
-                || black_box(&mut out),
-                |o| unsafe {
-                    let base = x.as_ptr();
-                    let mut rowbuf = vec![0f32; c];
-                    tract_onnx_opl::ml::math::matmul_rows_neon_gather(base, n, c, c as isize, 1, &w, e, o, &mut rowbuf);
-                    black_box(())
-                },
-                BatchSize::SmallInput,
-            );
-        });
+        group.bench_with_input(
+            BenchmarkId::new("matmul_rows_gather", format!("{}x{}x{}", n, c, e)),
+            &(n, c, e),
+            |bch, &(n, c, e)| {
+                bch.iter_batched(
+                    || (vec![0f32; n * e], vec![0f32; c]),
+                    |(mut out, mut rowbuf)| unsafe {
+                        let base = x.as_ptr();
+                        tract_onnx_opl::ml::math::matmul_rows_neon_gather(
+                            base,
+                            n,
+                            c,
+                            c as isize,
+                            1,
+                            &w,
+                            e,
+                            &mut out,
+                            &mut rowbuf,
+                        );
+                        black_box(())
+                    },
+                    BatchSize::SmallInput,
+                );
+            },
+        );
     }
 
     group.finish();

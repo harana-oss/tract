@@ -3,105 +3,152 @@
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-/// NEON-accelerated argmax over a single row, preserving first-maximum semantics.
+#[inline(always)]
 #[cfg(target_arch = "aarch64")]
-unsafe fn argmax_row_neon(row: &[f32]) -> usize {
+unsafe fn argmax_row_impl(row: &[f32]) -> usize {
     let len = row.len();
     let ptr = row.as_ptr();
     let mut i = 0usize;
 
-    // Track best value and index as scalars to preserve first-occurrence ordering across chunks.
     let mut best_val = core::f32::NEG_INFINITY;
     let mut best_idx = 0usize;
 
-    // 16-wide unrolled scan
+    // 16-wide unrolled with interleaved loads
     while i + 16 <= len {
-        let v0 = unsafe { vld1q_f32(ptr.add(i)) };
-        let v1 = unsafe { vld1q_f32(ptr.add(i + 4)) };
-        let v2 = unsafe { vld1q_f32(ptr.add(i + 8)) };
-        let v3 = unsafe { vld1q_f32(ptr.add(i + 12)) };
-        // Reduce each block to a scalar max quickly
-        let m01 = vmaxq_f32(v0, v1);
-        let m23 = vmaxq_f32(v2, v3);
+        // Load 4x4 with single instruction structure
+        let v = vld1q_f32_x4(ptr.add(i));
+
+        // Parallel max across all 4 vectors
+        let m01 = vmaxq_f32(v.0, v.1);
+        let m23 = vmaxq_f32(v.2, v.3);
         let m = vmaxq_f32(m01, m23);
         let chunk_max = vmaxvq_f32(m);
+
         if chunk_max > best_val {
-            // Find first index of chunk_max within the 16-lane chunk
-            // Check v0..v3 in order and lanes in increasing order to preserve first occurrence
-            // vceqq produces mask lanes; we then test per-lane scalars
-            let lanes = [v0, v1, v2, v3];
-            let mut local = 0usize;
-            'outer: for (b, vv) in lanes.iter().enumerate() {
-                let mask = vceqq_f32(*vv, vdupq_n_f32(chunk_max));
-                // Extract lanes as u32 mask values (all ones for true)
-                let arr: [u32; 4] = unsafe { core::mem::transmute(mask) };
-                for l in 0..4 {
-                    if arr[l] == u32::MAX {
-                        local = b * 4 + l;
-                        break 'outer;
-                    }
-                }
+            // Compare against broadcasted chunk_max
+            let cmv = vdupq_n_f32(chunk_max);
+
+            let mask0 = vceqq_f32(v.0, cmv);
+            let mask1 = vceqq_f32(v.1, cmv);
+            let mask2 = vceqq_f32(v.2, cmv);
+            let mask3 = vceqq_f32(v.3, cmv);
+
+            // Narrow comparison results into a compact bitmask (4 bits per lane)
+            let narrow01 = vshrn_n_u32::<4>(mask0);
+            let narrow23 = vshrn_n_u32::<4>(mask1);
+            let narrow45 = vshrn_n_u32::<4>(mask2);
+            let narrow67 = vshrn_n_u32::<4>(mask3);
+
+            let combined01 = vcombine_u16(narrow01, narrow23);
+            let combined23 = vcombine_u16(narrow45, narrow67);
+
+            let final_narrow1 = vshrn_n_u16::<4>(combined01);
+            let final_narrow2 = vshrn_n_u16::<4>(combined23);
+
+            let final_combined = vcombine_u8(final_narrow1, final_narrow2);
+            // Extract low 64 bits holding the first eight nibbles (covers all 16 lanes)
+            let bitmask = vget_lane_u64(vreinterpret_u64_u8(vget_low_u8(final_combined)), 0);
+
+            if bitmask != 0 {
+                // Use reverse_bits + leading_zeros to find index of first set nibble
+                let reversed = bitmask.reverse_bits();
+                let leading_zeros = reversed.leading_zeros();
+                let local = (leading_zeros as usize) >> 2; // 4 bits per lane
+
+                best_val = chunk_max;
+                best_idx = i + local;
             }
-            best_val = chunk_max;
-            best_idx = i + local;
         }
         i += 16;
     }
 
-    // Handle remaining 4-lane chunks
+    // 8-wide pass
+    if i + 8 <= len {
+        let v0 = vld1q_f32(ptr.add(i));
+        let v1 = vld1q_f32(ptr.add(i + 4));
+        let m = vmaxq_f32(v0, v1);
+        let chunk_max = vmaxvq_f32(m);
+
+        if chunk_max > best_val {
+            let cmv = vdupq_n_f32(chunk_max);
+            let mask0 = vceqq_f32(v0, cmv);
+            let mask1 = vceqq_f32(v1, cmv);
+
+            let narrow0 = vshrn_n_u32::<4>(mask0);
+            let narrow1 = vshrn_n_u32::<4>(mask1);
+            let combined = vcombine_u16(narrow0, narrow1);
+            let final_narrow = vshrn_n_u16::<4>(combined);
+
+            let bitmask = vget_lane_u64(vreinterpret_u64_u8(final_narrow), 0);
+
+            if bitmask != 0 {
+                let local = (bitmask.reverse_bits().leading_zeros() as usize) >> 2;
+                best_val = chunk_max;
+                best_idx = i + local;
+            }
+        }
+        i += 8;
+    }
+
+    // 4-wide pass
     while i + 4 <= len {
-        let v = unsafe { vld1q_f32(ptr.add(i)) };
+        let v = vld1q_f32(ptr.add(i));
         let v_max = vmaxvq_f32(v);
+
         if v_max > best_val {
-            let mask = vceqq_f32(v, vdupq_n_f32(v_max));
-            let arr: [u32; 4] = unsafe { core::mem::transmute(mask) };
-            for l in 0..4 {
-                if arr[l] == u32::MAX {
-                    best_val = v_max;
-                    best_idx = i + l;
-                    break;
-                }
+            let cmv = vdupq_n_f32(v_max);
+            let mask = vceqq_f32(v, cmv);
+
+            let narrow = vshrn_n_u32::<4>(mask);
+            let bitmask = vget_lane_u32(vreinterpret_u32_u16(narrow), 0);
+
+            if bitmask != 0 {
+                let local = (bitmask.reverse_bits().leading_zeros() as usize) >> 3; // 8 bits per lane after shrn
+                best_val = v_max;
+                best_idx = i + local;
             }
         }
         i += 4;
     }
 
-    // Tail scalar scan (also covers entirely short rows)
+    // Scalar tail
     while i < len {
-        let v = unsafe { *ptr.add(i) };
+        let v = *ptr.add(i);
         if v > best_val {
             best_val = v;
             best_idx = i;
         }
         i += 1;
     }
+
     best_idx
+}
+
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
+pub fn argmax_row(row: &[f32]) -> usize {
+    unsafe { argmax_row_impl(row) }
 }
 
 use super::smallvec::SmallVec;
 thread_local! {
-    // Inline capacity tuned for common small row sizes; grows to heap if needed
     static ARGMAX_ROWBUF_TL: std::cell::RefCell<SmallVec<f32, 256>> =
         std::cell::RefCell::new(SmallVec::new());
 }
 
-/// Compute argmax for each row of a matrix stored row-major in `matrix` with shape (n, e) (contiguous case).
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub fn argmax_rows(matrix: &[f32], n: usize, e: usize) -> Vec<usize> {
     let mut out = Vec::with_capacity(n);
     for i in 0..n {
         let row = &matrix[i * e..(i + 1) * e];
-        #[cfg(target_arch = "aarch64")]
-        unsafe {
-            out.push(argmax_row_neon(row));
-        }
+        out.push(argmax_row(row));
     }
     out
 }
 
-/// Compute argmax for rows gathered from a strided input pointer into a scratch buffer, writing indices into `out_idx`.
-/// Strides s0 (row) and s1 (inner) are in elements (not bytes).
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn argmax_rows_gather_into(
     input_ptr: *const f32,
     n: usize,
@@ -117,15 +164,12 @@ pub unsafe fn argmax_rows_gather_into(
             rowbuf[k] = *input_ptr.offset(off);
         }
         let row = &rowbuf[..e];
-        #[cfg(target_arch = "aarch64")]
-        {
-            out_idx[i] = argmax_row_neon(row);
-        }
+        out_idx[i] = argmax_row(row);
     }
 }
 
-/// Convenience wrapper that allocates a thread-local scratch row buffer and returns the indices.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn argmax_rows_gather(
     input_ptr: *const f32,
     n: usize,

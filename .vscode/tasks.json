@@ -182,6 +182,24 @@
 				"-p",
 				"tract-data"
 			]
+		},
+		{
+			"label": "cargo check onnx-opl (linear classifier precompute)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx-opl"
+			]
+		},
+		{
+			"label": "cargo check workspace (linear classifier precompute)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			]
 		}
 	]
 }

@@ -1,3 +1,4 @@
+use crate::ml::softmax;
 use std::hash::{Hash, Hasher};
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
@@ -136,31 +137,12 @@ impl LinearRegressorOp {
         match self.post_transform {
             PostTransformLR::None => {}
             PostTransformLR::Logistic => {
-                for v in out.iter_mut() {
-                    *v = 1.0 / (1.0 + (-*v).exp());
-                }
+                let slice = out.as_slice_mut().unwrap();
+                softmax::logistic_inplace_rows(slice, n, t);
             }
             PostTransformLR::Softmax => {
-                // per-row softmax
-                for i in 0..n {
-                    let mut max_v = out[[i, 0]];
-                    for j in 1..t {
-                        let v = out[[i, j]];
-                        if v > max_v {
-                            max_v = v;
-                        }
-                    }
-                    let mut sum = 0f32;
-                    for j in 0..t {
-                        let v = (out[[i, j]] - max_v).exp();
-                        out[[i, j]] = v;
-                        sum += v;
-                    }
-                    let inv = 1.0 / sum;
-                    for j in 0..t {
-                        out[[i, j]] *= inv;
-                    }
-                }
+                let slice = out.as_slice_mut().unwrap();
+                softmax::softmax_inplace_rows(slice, n, t);
             }
         }
         Ok(out)

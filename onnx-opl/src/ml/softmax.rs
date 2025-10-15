@@ -84,6 +84,7 @@ pub unsafe fn softmax_rows_gather_into_tl(
     });
 }
 
+// NEON softmax using vexp_f32_softmax_fast
 unsafe fn softmax_neon(row: &mut [f32]) {
     let len = row.len();
     let ptr = row.as_mut_ptr();
@@ -143,11 +144,11 @@ unsafe fn softmax_neon(row: &mut [f32]) {
         v2 = vsubq_f32(v2, max_broadcast);
         v3 = vsubq_f32(v3, max_broadcast);
 
-        // Vector exp approximation (poly4)
-        v0 = vexp_f32_poly4(v0);
-        v1 = vexp_f32_poly4(v1);
-        v2 = vexp_f32_poly4(v2);
-        v3 = vexp_f32_poly4(v3);
+        // Vector exp approximation (softmax_fast)
+        v0 = vexp_f32_softmax_fast(v0);
+        v1 = vexp_f32_softmax_fast(v1);
+        v2 = vexp_f32_softmax_fast(v2);
+        v3 = vexp_f32_softmax_fast(v3);
 
         vst1q_f32(ptr.add(i), v0);
         vst1q_f32(ptr.add(i + 4), v1);
@@ -168,7 +169,7 @@ unsafe fn softmax_neon(row: &mut [f32]) {
     while i + 4 <= len {
         let mut v = vld1q_f32(ptr.add(i));
         v = vsubq_f32(v, max_broadcast);
-        v = vexp_f32_poly4(v);
+        v = vexp_f32_softmax_fast(v);
         vst1q_f32(ptr.add(i), v);
         sum_vec[0] = vaddq_f32(sum_vec[0], v);
         i += 4;
@@ -240,48 +241,6 @@ unsafe fn vexp_f32_softmax_fast(x: float32x4_t) -> float32x4_t {
     vaddq_f32(prod, two_i)
 }
 
-// Polynomial exp approximation with range reduction: exp(x) = 2^n * P(r), r in [-ln2, ln2]
-// Coefficients: simple 5th-order Taylor to keep code self-contained.
-// P(r) ~ c0 + c1 r + c2 r^2 + c3 r^3 + c4 r^4, with c0..c4 below.
-// Implemented using vfmaq_laneq_f32 and a packed coefficient vector for c0..c3.
-#[inline(always)]
-unsafe fn vexp_f32_poly4(x: float32x4_t) -> float32x4_t {
-    // Clamp to a safe lower bound (softmax domain is <= 0 after max-sub), avoid extreme tails
-    let x = vmaxq_f32(x, vdupq_n_f32(-30.0));
-
-    // Range reduction: n = floor(x * log2e); r = x - n*ln2
-    let log2e = vdupq_n_f32(1.4426950408889634_f32);
-    let ln2 = vdupq_n_f32(0.6931471805599453_f32);
-    let y = vmulq_f32(x, log2e);
-    // floor(y) to nearest lower int
-    let n_i = vcvtq_s32_f32(vrndmq_f32(y));
-    let n_f = vcvtq_f32_s32(n_i);
-    let r = vsubq_f32(x, vmulq_f32(n_f, ln2));
-
-    // Polynomial approximation P(r) ≈ 1 + r + r^2/2 + r^3/6 + r^4/24
-    const C0: f32 = 1.0;
-    const C1: f32 = 1.0;
-    const C2: f32 = 0.5;
-    const C3: f32 = 1.0 / 6.0;
-    const C4: f32 = 1.0 / 24.0;
-    let coef = vld1q_f32([C0, C1, C2, C3].as_ptr());
-    let x2 = vmulq_f32(r, r);
-    let x3 = vmulq_f32(x2, r);
-    let x4 = vmulq_f32(x2, x2);
-    let mut p = vdupq_n_f32(0.0);
-    // p = C0 + C1*r + C2*r^2 + C3*r^3 + C4*r^4
-    p = vfmaq_laneq_f32(p, vdupq_n_f32(1.0), coef, 0); // + C0
-    p = vfmaq_laneq_f32(p, r, coef, 1); // + C1*r
-    p = vfmaq_laneq_f32(p, x2, coef, 2); // + C2*r^2
-    p = vfmaq_laneq_f32(p, x3, coef, 3); // + C3*r^3
-    p = vmlaq_f32(p, x4, vdupq_n_f32(C4)); // + C4*r^4
-
-    // Scale by 2^n via exponent bit construction
-    let exp_n_bits = vshlq_n_s32(vaddq_s32(n_i, vdupq_n_s32(127)), 23);
-    let exp_n = vreinterpretq_f32_s32(exp_n_bits);
-    vmulq_f32(p, exp_n)
-}
-
 /// In-place logistic over rows: y = 1 / (1 + exp(-x))
 #[inline(always)]
 pub fn logistic_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
@@ -294,71 +253,70 @@ pub fn logistic_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
             let row = &mut data[r * cols..(r + 1) * cols];
             let mut i = 0usize;
             let ptr = row.as_mut_ptr();
-            while i + 16 <= cols {
+            // 8-way unroll
+            while i + 32 <= cols {
                 let mut v0 = vld1q_f32(ptr.add(i));
                 let mut v1 = vld1q_f32(ptr.add(i + 4));
                 let mut v2 = vld1q_f32(ptr.add(i + 8));
                 let mut v3 = vld1q_f32(ptr.add(i + 12));
-                v0 = vnegq_f32(v0);
-                v1 = vnegq_f32(v1);
-                v2 = vnegq_f32(v2);
-                v3 = vnegq_f32(v3);
-                v0 = vexp_f32_poly4(v0);
-                v1 = vexp_f32_poly4(v1);
-                v2 = vexp_f32_poly4(v2);
-                v3 = vexp_f32_poly4(v3);
-                v0 = vaddq_f32(v0, vdupq_n_f32(1.0));
-                v1 = vaddq_f32(v1, vdupq_n_f32(1.0));
-                v2 = vaddq_f32(v2, vdupq_n_f32(1.0));
-                v3 = vaddq_f32(v3, vdupq_n_f32(1.0));
-                v0 = vrecpeq_f32(v0);
-                v1 = vrecpeq_f32(v1);
-                v2 = vrecpeq_f32(v2);
-                v3 = vrecpeq_f32(v3);
-                // One Newton-Raphson step for better reciprocal accuracy
-                let two = vdupq_n_f32(2.0);
-                v0 = vmulq_f32(
-                    v0,
-                    vsubq_f32(
-                        two,
-                        vmulq_f32(v0, vaddq_f32(vld1q_f32(ptr.add(i)), vdupq_n_f32(1.0))),
-                    ),
-                );
-                v1 = vmulq_f32(
-                    v1,
-                    vsubq_f32(
-                        two,
-                        vmulq_f32(v1, vaddq_f32(vld1q_f32(ptr.add(i + 4)), vdupq_n_f32(1.0))),
-                    ),
-                );
-                v2 = vmulq_f32(
-                    v2,
-                    vsubq_f32(
-                        two,
-                        vmulq_f32(v2, vaddq_f32(vld1q_f32(ptr.add(i + 8)), vdupq_n_f32(1.0))),
-                    ),
-                );
-                v3 = vmulq_f32(
-                    v3,
-                    vsubq_f32(
-                        two,
-                        vmulq_f32(v3, vaddq_f32(vld1q_f32(ptr.add(i + 12)), vdupq_n_f32(1.0))),
-                    ),
-                );
-                vst1q_f32(ptr.add(i), v0);
-                vst1q_f32(ptr.add(i + 4), v1);
-                vst1q_f32(ptr.add(i + 8), v2);
-                vst1q_f32(ptr.add(i + 12), v3);
-                i += 16;
+                let mut v4 = vld1q_f32(ptr.add(i + 16));
+                let mut v5 = vld1q_f32(ptr.add(i + 20));
+                let mut v6 = vld1q_f32(ptr.add(i + 24));
+                let mut v7 = vld1q_f32(ptr.add(i + 28));
+
+                v0 = vexp_f32_softmax_fast(vnegq_f32(v0));
+                v1 = vexp_f32_softmax_fast(vnegq_f32(v1));
+                v2 = vexp_f32_softmax_fast(vnegq_f32(v2));
+                v3 = vexp_f32_softmax_fast(vnegq_f32(v3));
+                v4 = vexp_f32_softmax_fast(vnegq_f32(v4));
+                v5 = vexp_f32_softmax_fast(vnegq_f32(v5));
+                v6 = vexp_f32_softmax_fast(vnegq_f32(v6));
+                v7 = vexp_f32_softmax_fast(vnegq_f32(v7));
+
+                let one = vdupq_n_f32(1.0);
+                v0 = vaddq_f32(v0, one);
+                v1 = vaddq_f32(v1, one);
+                v2 = vaddq_f32(v2, one);
+                v3 = vaddq_f32(v3, one);
+                v4 = vaddq_f32(v4, one);
+                v5 = vaddq_f32(v5, one);
+                v6 = vaddq_f32(v6, one);
+                v7 = vaddq_f32(v7, one);
+
+                // Reciprocal with one NR refinement: y = y*(2 - d*y)
+                let mut y0 = vrecpeq_f32(v0);
+                let mut y1 = vrecpeq_f32(v1);
+                let mut y2 = vrecpeq_f32(v2);
+                let mut y3 = vrecpeq_f32(v3);
+                let mut y4 = vrecpeq_f32(v4);
+                let mut y5 = vrecpeq_f32(v5);
+                let mut y6 = vrecpeq_f32(v6);
+                let mut y7 = vrecpeq_f32(v7);
+                y0 = vmulq_f32(y0, vrecpsq_f32(y0, v0));
+                y1 = vmulq_f32(y1, vrecpsq_f32(y1, v1));
+                y2 = vmulq_f32(y2, vrecpsq_f32(y2, v2));
+                y3 = vmulq_f32(y3, vrecpsq_f32(y3, v3));
+                y4 = vmulq_f32(y4, vrecpsq_f32(y4, v4));
+                y5 = vmulq_f32(y5, vrecpsq_f32(y5, v5));
+                y6 = vmulq_f32(y6, vrecpsq_f32(y6, v6));
+                y7 = vmulq_f32(y7, vrecpsq_f32(y7, v7));
+
+                vst1q_f32(ptr.add(i), y0);
+                vst1q_f32(ptr.add(i + 4), y1);
+                vst1q_f32(ptr.add(i + 8), y2);
+                vst1q_f32(ptr.add(i + 12), y3);
+                vst1q_f32(ptr.add(i + 16), y4);
+                vst1q_f32(ptr.add(i + 20), y5);
+                vst1q_f32(ptr.add(i + 24), y6);
+                vst1q_f32(ptr.add(i + 28), y7);
+                i += 32;
             }
             while i + 4 <= cols {
-                let mut v = vld1q_f32(ptr.add(i));
-                v = vnegq_f32(v);
-                v = vexp_f32_poly4(v);
-                v = vaddq_f32(v, vdupq_n_f32(1.0));
-                let mut y = vrecpeq_f32(v);
-                let two = vdupq_n_f32(2.0);
-                y = vmulq_f32(y, vsubq_f32(two, vmulq_f32(y, v)));
+                let mut d = vld1q_f32(ptr.add(i));
+                d = vexp_f32_softmax_fast(vnegq_f32(d));
+                d = vaddq_f32(d, vdupq_n_f32(1.0));
+                let mut y = vrecpeq_f32(d);
+                y = vmulq_f32(y, vrecpsq_f32(y, d));
                 vst1q_f32(ptr.add(i), y);
                 i += 4;
             }
@@ -370,3 +328,5 @@ pub fn logistic_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
         }
     }
 }
+
+// (Removed auxiliary benchmarking wrappers and alternate exp/softmax implementations)

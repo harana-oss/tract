@@ -14,8 +14,13 @@ use tract_onnx::tract_core::dims;
 #[global_allocator]
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
+mod thread_setup;
+
 fn bench_linear_regressor(c: &mut Criterion) {
     let mut group = c.benchmark_group("onnx_linear_regressor");
+
+    // Ensure Rayon worker threads are configured before any parallel work.
+    thread_setup::init();
 
     let model_path = std::env::var("MODEL_PATH")
         .expect("Set MODEL_PATH to an existing .onnx file containing ai.onnx.ml.LinearRegressor");

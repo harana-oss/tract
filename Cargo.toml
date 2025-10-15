@@ -152,6 +152,7 @@ float-ord = "0.3.2"
 foreign-types = "0.5"
 fs-err = "2"
 fs2 = "0.4.3"
+gdt-cpus = "25.5.0"
 getrandom = "0.2"
 half = { version=">=2.4,<3.0", features = [ "std", "num-traits" ] }
 home = "=0.5.11"

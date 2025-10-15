@@ -11,12 +11,17 @@ use std::time::Instant;
 use tract_hir::internal::*;
 use tract_onnx::tract_core::dims;
 
+mod thread_setup;
+
 #[global_allocator]
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn bench_linear_classifier(c: &mut Criterion) {
     let mut group = c.benchmark_group("onnx_linear_classifier");
     group.sample_size(10);
+
+    // Ensure Rayon worker threads are configured before any parallel work.
+    thread_setup::init();
 
     let model_path = std::env::var("MODEL_PATH")
         .expect("Set MODEL_PATH to an existing .onnx file containing ai.onnx.ml.LinearClassifier");
@@ -55,7 +60,6 @@ fn bench_linear_classifier(c: &mut Criterion) {
         .unwrap_or_else(|| tvec![1, input_dim]);
     let num_features = shape[1];
 
-    // Pre-generate random input tensors
     let mut rng = Xoshiro256PlusPlus::seed_from_u64(42);
     let input_tensors: Arc<Vec<Tensor>> = Arc::new(
         (0..(15_000))
@@ -67,7 +71,6 @@ fn bench_linear_classifier(c: &mut Criterion) {
             .collect(),
     );
 
-    // Build the execution plan once; it will be cloned per thread
     let plan = TypedSimplePlan::new(model.clone()).unwrap();
 
     group.bench_function(
@@ -80,7 +83,6 @@ fn bench_linear_classifier(c: &mut Criterion) {
 
                 (0..15_000).into_par_iter().for_each(|i| {
                     let input_val = tensors[i].clone().into_tvalue();
-
                     let mut state = SimpleState::new(plan.clone()).unwrap();
                     let mut inputs = TVec::new();
 

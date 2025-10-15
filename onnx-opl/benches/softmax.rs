@@ -1,6 +1,4 @@
-use criterion::{
-    BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
-};
+use criterion::{BatchSize, BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::prelude::*;
 
 fn bench_softmax_rows(c: &mut Criterion) {
@@ -20,13 +18,13 @@ fn bench_softmax_rows(c: &mut Criterion) {
             |b, &cols| {
                 b.iter_batched(
                     || {
-                        // Reset buffer from pristine source each iter
-                        buf.copy_from_slice(&src);
-                        black_box(&mut buf)
+                        // Fresh working buffer each iter
+                        let mut working = src.clone();
+                        std::hint::black_box(working)
                     },
-                    |d| {
-                        tract_onnx_opl::ml::softmax::softmax_inplace_rows(d, rows, cols);
-                        black_box(())
+                    |mut d| {
+                        tract_onnx_opl::ml::softmax::softmax_inplace_rows(&mut d, rows, cols);
+                        std::hint::black_box(())
                     },
                     BatchSize::SmallInput,
                 )

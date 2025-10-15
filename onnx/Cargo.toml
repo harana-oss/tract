@@ -20,6 +20,7 @@ maintenance = { status = "actively-developed" }
 [dependencies]
 bytes.workspace = true
 derive-new.workspace = true
+gdt-cpus.workspace = true
 log.workspace = true
 memmap2.workspace = true
 num-integer.workspace = true
@@ -40,6 +41,8 @@ tract-onnx-opl.workspace = true
 env_logger.workspace = true
 criterion.workspace = true
 ureq = { version = "2", default-features = true }
+libc = "0.2"
+num_cpus = "1"
 
 [[bench]]
 name = "linear_classifier"
