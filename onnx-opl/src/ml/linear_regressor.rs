@@ -1,4 +1,9 @@
-use crate::ml::softmax;
+#![allow(unsafe_op_in_unsafe_fn)]
+#[cfg(not(target_arch = "aarch64"))]
+compile_error!("NEON-only build: linear_regressor requires target_arch = aarch64");
+
+use crate::ml::{math, softmax};
+use std::arch::aarch64::*;
 use std::hash::{Hash, Hasher};
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
@@ -92,6 +97,83 @@ pub struct LinearRegressorOp {
 }
 
 impl LinearRegressorOp {
+    /// Optimized NEON-accelerated bias addition
+    #[inline(always)]
+    unsafe fn add_bias_neon(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
+        debug_assert_eq!(out.len(), n * t);
+        debug_assert_eq!(bias.len(), t);
+        
+        for i in 0..n {
+            let row_ptr = out.as_mut_ptr().add(i * t);
+            let mut j = 0;
+            
+            // Process 16 elements at a time
+            while j + 16 <= t {
+                let s0 = vld1q_f32(row_ptr.add(j));
+                let s1 = vld1q_f32(row_ptr.add(j + 4));
+                let s2 = vld1q_f32(row_ptr.add(j + 8));
+                let s3 = vld1q_f32(row_ptr.add(j + 12));
+                let b0 = vld1q_f32(bias.as_ptr().add(j));
+                let b1 = vld1q_f32(bias.as_ptr().add(j + 4));
+                let b2 = vld1q_f32(bias.as_ptr().add(j + 8));
+                let b3 = vld1q_f32(bias.as_ptr().add(j + 12));
+                vst1q_f32(row_ptr.add(j), vaddq_f32(s0, b0));
+                vst1q_f32(row_ptr.add(j + 4), vaddq_f32(s1, b1));
+                vst1q_f32(row_ptr.add(j + 8), vaddq_f32(s2, b2));
+                vst1q_f32(row_ptr.add(j + 12), vaddq_f32(s3, b3));
+                j += 16;
+            }
+            
+            // Process 4 elements at a time
+            while j + 4 <= t {
+                let s = vld1q_f32(row_ptr.add(j));
+                let b = vld1q_f32(bias.as_ptr().add(j));
+                vst1q_f32(row_ptr.add(j), vaddq_f32(s, b));
+                j += 4;
+            }
+            
+            // Scalar tail
+            while j < t {
+                *row_ptr.add(j) += *bias.as_ptr().add(j);
+                j += 1;
+            }
+        }
+    }
+    
+    /// Optimized NEON-accelerated scalar bias addition
+    #[inline(always)]
+    unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
+        let len = out.len();
+        let bias_vec = vdupq_n_f32(bias);
+        let mut i = 0;
+        
+        // Process 16 elements at a time
+        while i + 16 <= len {
+            let v0 = vld1q_f32(out.as_ptr().add(i));
+            let v1 = vld1q_f32(out.as_ptr().add(i + 4));
+            let v2 = vld1q_f32(out.as_ptr().add(i + 8));
+            let v3 = vld1q_f32(out.as_ptr().add(i + 12));
+            vst1q_f32(out.as_mut_ptr().add(i), vaddq_f32(v0, bias_vec));
+            vst1q_f32(out.as_mut_ptr().add(i + 4), vaddq_f32(v1, bias_vec));
+            vst1q_f32(out.as_mut_ptr().add(i + 8), vaddq_f32(v2, bias_vec));
+            vst1q_f32(out.as_mut_ptr().add(i + 12), vaddq_f32(v3, bias_vec));
+            i += 16;
+        }
+        
+        // Process 4 elements at a time
+        while i + 4 <= len {
+            let v = vld1q_f32(out.as_ptr().add(i));
+            vst1q_f32(out.as_mut_ptr().add(i), vaddq_f32(v, bias_vec));
+            i += 4;
+        }
+        
+        // Scalar tail
+        while i < len {
+            out[i] += bias;
+            i += 1;
+        }
+    }
+    
     fn eval_internal(&self, input: ArrayViewD<f32>) -> TractResult<Array2<f32>> {
         // Avoid use-after-move by separating len fetch.
         let input_2d: ArrayView2<f32> = if input.ndim() == 1 {
@@ -106,45 +188,47 @@ impl LinearRegressorOp {
             bail!("Feature mismatch: model {} != input {}", self.data.feat_c, c);
         }
         let t = self.data.targets;
-        let w = &self.data.coefficients_raw;
+        
         let mut out = Array2::<f32>::zeros((n, t));
-        // simple loops (targets usually small)
-        for i in 0..n {
-            let row = input_2d.row(i);
-            for target in 0..t {
-                let mut acc = 0f32;
-                for f in 0..c {
-                    acc += row[f] * w[target * c + f];
+        
+        // Use optimized NEON matmul with pre-computed transposed coefficients
+        // The transposed layout is feature-major [c, t] which is optimal for NEON
+        unsafe {
+            let input_slice = input_2d.as_slice().unwrap();
+            let out_slice = out.as_slice_mut().unwrap();
+            
+            // Use the pre-computed transposed coefficients for better cache locality
+            math::matmul_rows_neon_contig_t(
+                input_slice,
+                n,
+                c,
+                &self.data.coefficients_t,
+                t,
+                out_slice,
+            );
+            
+            // Add bias if present using vectorized operations
+            if let Some(intercepts) = &self.data.intercepts {
+                let b = intercepts.as_slice::<f32>()?;
+                if b.len() == t {
+                    Self::add_bias_neon(out_slice, b, n, t);
+                } else if b.len() == 1 {
+                    Self::add_scalar_bias_neon(out_slice, b[0]);
                 }
-                out[[i, target]] = acc;
+            }
+            
+            // Apply post-transform in-place using existing optimized functions
+            match self.post_transform {
+                PostTransformLR::None => {}
+                PostTransformLR::Logistic => {
+                    softmax::logistic_inplace_rows(out_slice, n, t);
+                }
+                PostTransformLR::Softmax => {
+                    softmax::softmax_inplace_rows(out_slice, n, t);
+                }
             }
         }
-        if let Some(intercepts) = &self.data.intercepts {
-            let b = intercepts.as_slice::<f32>()?;
-            if b.len() == t {
-                for i in 0..n {
-                    for target in 0..t {
-                        out[[i, target]] += b[target];
-                    }
-                }
-            } else if b.len() == 1 {
-                let bias = b[0];
-                for v in out.iter_mut() {
-                    *v += bias;
-                }
-            }
-        }
-        match self.post_transform {
-            PostTransformLR::None => {}
-            PostTransformLR::Logistic => {
-                let slice = out.as_slice_mut().unwrap();
-                softmax::logistic_inplace_rows(slice, n, t);
-            }
-            PostTransformLR::Softmax => {
-                let slice = out.as_slice_mut().unwrap();
-                softmax::softmax_inplace_rows(slice, n, t);
-            }
-        }
+        
         Ok(out)
     }
 
