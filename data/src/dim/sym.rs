@@ -412,15 +412,19 @@ pub struct SymbolValues {
 }
 
 impl SymbolValues {
-    pub fn with(mut self, s: &Symbol, v: i64) -> Self {
+
+  #[inline]
+  pub fn with(mut self, s: &Symbol, v: i64) -> Self {
         self.set(s, v);
         self
     }
 
+    #[inline]
     pub fn set(&mut self, s: &Symbol, v: i64) {
-        self.values.insert(s.clone(), v);
+        self.values.insert(*s, v);
     }
 
+    #[inline]
     pub fn get(&self, s: &Symbol) -> Option<i64> {
         self.values.get(s).copied()
     }
