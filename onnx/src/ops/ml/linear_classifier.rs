@@ -140,6 +140,13 @@ impl Expansion for LinearClassifier {
                 DatumType::String => Some(self.labels.as_slice::<String>()?.to_vec().into()),
                 _ => None,
             },
+            labels_are_iota: match self.labels.datum_type() {
+                DatumType::I64 => {
+                    let sl = self.labels.as_slice::<i64>()?;
+                    sl.iter().enumerate().all(|(i, &v)| v == i as i64)
+                }
+                _ => false,
+            },
             packed_tiled: None,
             prefer_transposed: eff_e >= 4 && feat_c >= 16,
             m_out: if eff_e == 1 && e == 2 { 2 } else { eff_e },

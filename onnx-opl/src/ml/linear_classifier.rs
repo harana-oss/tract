@@ -54,6 +54,7 @@ pub struct LinearClassifierData {
     pub coefficients_t: Arc<[f32]>,
     pub labels_i64: Option<Arc<[i64]>>,
     pub labels_str: Option<Arc<[String]>>,
+    pub labels_are_iota: bool,
     pub packed_tiled: Option<MatmulTiled>,
     pub prefer_transposed: bool,
     pub m_out: usize,
@@ -192,30 +193,66 @@ impl LinearClassifier {
 
     #[inline(always)]
     fn labels_from_argmax(&self, argmax: &[usize]) -> TractResult<Tensor> {
+        // Fast-path: cached string labels
         if let Some(ref lbls) = self.data.labels_str {
-            let mapped: Vec<String> =
-                argmax.iter().map(|&i| lbls.get(i).cloned().unwrap_or_default()).collect();
+            // Avoid per-element bounds checks; argmax indices are guaranteed to be < labels.len()
+            let base: &[String] = lbls.as_ref();
+            let mut mapped: Vec<String> = Vec::with_capacity(argmax.len());
+            unsafe {
+                for &idx in argmax {
+                    debug_assert!(idx < base.len());
+                    mapped.push(base.get_unchecked(idx).clone());
+                }
+            }
             return Ok(tensor1(&mapped));
         }
+        // Fast-path: cached i64 labels (including iota shortcut)
         if let Some(ref lbls) = self.data.labels_i64 {
-            let mapped: Vec<i64> =
-                argmax.iter().map(|&i| lbls.get(i).copied().unwrap_or(0)).collect();
-            return Ok(tensor1(&mapped));
+            let n = argmax.len();
+            // If labels are exactly [0, 1, ..., e-1], skip the lookup entirely
+            if self.data.labels_are_iota {
+                let mut out = unsafe { Tensor::uninitialized::<i64>(&[n]) }?;
+                let out_slice = out.as_slice_mut::<i64>()?;
+                for (j, &idx) in argmax.iter().enumerate() {
+                    out_slice[j] = idx as i64;
+                }
+                return Ok(out);
+            }
+            let base: &[i64] = lbls.as_ref();
+            let mut out = unsafe { Tensor::uninitialized::<i64>(&[n]) }?;
+            let out_slice = out.as_slice_mut::<i64>()?;
+            unsafe {
+                for (j, &idx) in argmax.iter().enumerate() {
+                    debug_assert!(idx < base.len());
+                    out_slice[j] = *base.get_unchecked(idx);
+                }
+            }
+            return Ok(out);
         }
         match self.data.labels.datum_type() {
             DatumType::String => {
                 let label_slice = self.data.labels.as_slice::<String>()?;
-                let mapped: Vec<String> = argmax
-                    .iter()
-                    .map(|&i| label_slice.get(i).cloned().unwrap_or_default())
-                    .collect();
+                let mut mapped: Vec<String> = Vec::with_capacity(argmax.len());
+                unsafe {
+                    for &idx in argmax {
+                        debug_assert!(idx < label_slice.len());
+                        mapped.push(label_slice.get_unchecked(idx).clone());
+                    }
+                }
                 Ok(tensor1(&mapped))
             }
             DatumType::I64 => {
                 let label_slice = self.data.labels.as_slice::<i64>()?;
-                let mapped: Vec<i64> =
-                    argmax.iter().map(|&i| label_slice.get(i).copied().unwrap_or(0)).collect();
-                Ok(tensor1(&mapped))
+                let n = argmax.len();
+                let mut out = unsafe { Tensor::uninitialized::<i64>(&[n]) }?;
+                let out_slice = out.as_slice_mut::<i64>()?;
+                unsafe {
+                    for (j, &idx) in argmax.iter().enumerate() {
+                        debug_assert!(idx < label_slice.len());
+                        out_slice[j] = *label_slice.get_unchecked(idx);
+                    }
+                }
+                Ok(out)
             }
             other => bail!("Unsupported label type: {:?}", other),
         }
@@ -749,6 +786,14 @@ fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractRes
         labels_str: match labels.datum_type() {
             DatumType::String => Some(labels.as_slice::<String>()?.to_vec().into()),
             _ => None,
+        },
+        labels_are_iota: match labels.datum_type() {
+            DatumType::I64 => {
+                let sl = labels.as_slice::<i64>()?;
+                // true if labels == [0,1,2,...,e-1]
+                sl.iter().enumerate().all(|(i, &v)| v == i as i64)
+            }
+            _ => false,
         },
         packed_tiled,
         prefer_transposed,
