@@ -2,6 +2,8 @@
 #[cfg(not(target_arch = "aarch64"))]
 compile_error!("NEON-only build: linear_regressor requires target_arch = aarch64");
 
+use super::smallvec::SmallVec;
+use crate::ml::matmul::MatmulTiled;
 use crate::ml::{math, softmax};
 use std::arch::aarch64::*;
 use std::hash::{Hash, Hasher};
@@ -32,6 +34,10 @@ pub struct LinearRegressorData {
     pub feat_c: usize,
     pub coefficients_raw: Arc<[f32]>, // row-major (targets, feat_c)
     pub coefficients_t: Arc<[f32]>,   // transposed (feat_c, targets)
+    pub prefer_transposed: bool,
+    pub packed_tiled: Option<MatmulTiled>,
+    pub bias_scalar: f32,
+    pub intercepts_vec: Option<Arc<[f32]>>, // length == targets
 }
 
 impl Hash for LinearRegressorData {
@@ -79,6 +85,32 @@ impl LinearRegressorData {
         }
         let coefficients_raw: Arc<[f32]> = coeff_slice.to_vec().into();
         let coefficients_t: Arc<[f32]> = transposed.into();
+
+        // Heuristics consistent with LinearClassifier
+        let prefer_transposed = t >= 4 && feat_c >= 16;
+        let packed_tiled = if t >= 8 && feat_c >= 16 {
+            Some(MatmulTiled::new_from_transposed(&coefficients_t, feat_c, t))
+        } else {
+            None
+        };
+
+        // Precompute bias representation
+        let mut bias_scalar = 0.0f32;
+        let mut intercepts_vec: Option<Arc<[f32]>> = None;
+        if let Some(b) = &intercepts {
+            let bsl = b.as_slice::<f32>()?;
+            if bsl.len() == 1 {
+                bias_scalar = bsl[0];
+            } else if bsl.len() == t {
+                intercepts_vec = Some(bsl.to_vec().into());
+            } else {
+                bail!(
+                    "Unsupported intercepts length {}, expected 1 or {}",
+                    bsl.len(),
+                    t
+                );
+            }
+        }
         Ok(Self {
             coefficients: coefficients.clone(), // clone to avoid move while slice borrowed
             intercepts,
@@ -86,6 +118,10 @@ impl LinearRegressorData {
             feat_c,
             coefficients_raw,
             coefficients_t,
+            prefer_transposed,
+            packed_tiled,
+            bias_scalar,
+            intercepts_vec,
         })
     }
 }
@@ -97,16 +133,32 @@ pub struct LinearRegressorOp {
 }
 
 impl LinearRegressorOp {
+    // Thread-local row buffer to handle non-contiguous inputs without heap churn
+    #[inline(always)]
+    fn with_rowbuf<F: FnOnce(&mut [f32]) -> R, R>(len: usize, f: F) -> R {
+        thread_local! {
+            static ROWBUF_TL_LR: std::cell::RefCell<SmallVec<f32, 256>> = std::cell::RefCell::new(SmallVec::new());
+        }
+        ROWBUF_TL_LR.with(|rb| {
+            let mut v = rb.borrow_mut();
+            let mut h = v.handle();
+            if h.len() < len {
+                h.resize(len, 0.0);
+            }
+            f(&mut h[..len])
+        })
+    }
+
     /// Optimized NEON-accelerated bias addition
     #[inline(always)]
     unsafe fn add_bias_neon(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
         debug_assert_eq!(out.len(), n * t);
         debug_assert_eq!(bias.len(), t);
-        
+
         for i in 0..n {
             let row_ptr = out.as_mut_ptr().add(i * t);
             let mut j = 0;
-            
+
             // Process 16 elements at a time
             while j + 16 <= t {
                 let s0 = vld1q_f32(row_ptr.add(j));
@@ -123,7 +175,7 @@ impl LinearRegressorOp {
                 vst1q_f32(row_ptr.add(j + 12), vaddq_f32(s3, b3));
                 j += 16;
             }
-            
+
             // Process 4 elements at a time
             while j + 4 <= t {
                 let s = vld1q_f32(row_ptr.add(j));
@@ -131,7 +183,7 @@ impl LinearRegressorOp {
                 vst1q_f32(row_ptr.add(j), vaddq_f32(s, b));
                 j += 4;
             }
-            
+
             // Scalar tail
             while j < t {
                 *row_ptr.add(j) += *bias.as_ptr().add(j);
@@ -139,14 +191,14 @@ impl LinearRegressorOp {
             }
         }
     }
-    
+
     /// Optimized NEON-accelerated scalar bias addition
     #[inline(always)]
     unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
         let len = out.len();
         let bias_vec = vdupq_n_f32(bias);
         let mut i = 0;
-        
+
         // Process 16 elements at a time
         while i + 16 <= len {
             let v0 = vld1q_f32(out.as_ptr().add(i));
@@ -159,23 +211,23 @@ impl LinearRegressorOp {
             vst1q_f32(out.as_mut_ptr().add(i + 12), vaddq_f32(v3, bias_vec));
             i += 16;
         }
-        
+
         // Process 4 elements at a time
         while i + 4 <= len {
             let v = vld1q_f32(out.as_ptr().add(i));
             vst1q_f32(out.as_mut_ptr().add(i), vaddq_f32(v, bias_vec));
             i += 4;
         }
-        
+
         // Scalar tail
         while i < len {
             out[i] += bias;
             i += 1;
         }
     }
-    
-    fn eval_internal(&self, input: ArrayViewD<f32>) -> TractResult<Array2<f32>> {
-        // Avoid use-after-move by separating len fetch.
+
+    pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
+        // Normalize input view to 2D (n, c)
         let input_2d: ArrayView2<f32> = if input.ndim() == 1 {
             let len = input.len();
             input.into_shape_with_order((1, len))?
@@ -188,36 +240,77 @@ impl LinearRegressorOp {
             bail!("Feature mismatch: model {} != input {}", self.data.feat_c, c);
         }
         let t = self.data.targets;
-        
-        let mut out = Array2::<f32>::zeros((n, t));
-        
-        // Use optimized NEON matmul with pre-computed transposed coefficients
-        // The transposed layout is feature-major [c, t] which is optimal for NEON
+
+        // Allocate output without zeroing
+        let mut out_tensor = unsafe { Tensor::uninitialized::<f32>(&[n, t]) }?;
+        let out_slice = out_tensor.as_slice_mut::<f32>()?;
+
+        // Matmul
         unsafe {
-            let input_slice = input_2d.as_slice().unwrap();
-            let out_slice = out.as_slice_mut().unwrap();
-            
-            // Use the pre-computed transposed coefficients for better cache locality
-            math::matmul_rows_neon_contig_t(
-                input_slice,
-                n,
-                c,
-                &self.data.coefficients_t,
-                t,
-                out_slice,
-            );
-            
-            // Add bias if present using vectorized operations
-            if let Some(intercepts) = &self.data.intercepts {
-                let b = intercepts.as_slice::<f32>()?;
-                if b.len() == t {
-                    Self::add_bias_neon(out_slice, b, n, t);
-                } else if b.len() == 1 {
-                    Self::add_scalar_bias_neon(out_slice, b[0]);
+            let coef_rm: &[f32] = &self.data.coefficients_raw;
+            let coef_t: &[f32] = &self.data.coefficients_t;
+            let packed = self.data.packed_tiled.as_ref();
+            let use_t = self.data.prefer_transposed;
+
+            if let Some(x) = input_2d.as_slice() {
+                if t == 1 && packed.is_none() {
+                    // Dot per row
+                    let w = &coef_rm[..c];
+                    for i in 0..n {
+                        let row = &x[i * c..(i + 1) * c];
+                        out_slice[i * t] = math::dot_neon(row, w);
+                    }
+                } else if let Some(pk) = packed {
+                    pk.gemm_rows_contig(x, n, out_slice);
+                } else if use_t {
+                    math::matmul_rows_neon_contig_t(x, n, c, coef_t, t, out_slice);
+                } else {
+                    math::matmul_rows_neon_contig(x, n, c, coef_rm, t, out_slice);
+                }
+            } else {
+                // Gathered path for strided/non-contiguous ndarray views
+                let base = input_2d.as_ptr();
+                // ndarray strides are in element counts already
+                let nd_strides = input_2d.strides();
+                let s0 = if n == 1 { 0 } else { nd_strides[0] as isize };
+                let s1 = nd_strides[1] as isize;
+                Self::with_rowbuf(c, |rowbuf| {
+                    if t == 1 && packed.is_none() {
+                        let w = &coef_rm[..c];
+                        for i in 0..n {
+                            // gather row i into rowbuf
+                            let mut k = 0usize;
+                            while k < c {
+                                let off = i as isize * s0 + k as isize * s1;
+                                rowbuf[k] = *base.offset(off);
+                                k += 1;
+                            }
+                            out_slice[i] = math::dot_neon(&rowbuf[..c], w);
+                        }
+                    } else if let Some(pk) = packed {
+                        pk.gemm_rows_gather(base, n, s0, s1, out_slice, rowbuf);
+                    } else if use_t {
+                        math::matmul_rows_neon_gather_t(
+                            base, n, c, s0, s1, coef_t, t, out_slice, rowbuf,
+                        );
+                    } else {
+                        math::matmul_rows_neon_gather(
+                            base, n, c, s0, s1, coef_rm, t, out_slice, rowbuf,
+                        );
+                    }
+                });
+            }
+
+            // Bias
+            for row in out_slice.chunks_mut(t) {
+                if let Some(b) = &self.data.intercepts_vec {
+                    Self::add_bias_neon(row, b, 1, t);
+                } else if self.data.bias_scalar != 0.0 {
+                    Self::add_scalar_bias_neon(row, self.data.bias_scalar);
                 }
             }
-            
-            // Apply post-transform in-place using existing optimized functions
+
+            // Post-transform
             match self.post_transform {
                 PostTransformLR::None => {}
                 PostTransformLR::Logistic => {
@@ -228,12 +321,8 @@ impl LinearRegressorOp {
                 }
             }
         }
-        
-        Ok(out)
-    }
 
-    pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
-        Ok(Tensor::from(self.eval_internal(input)?.into_dyn()))
+        Ok(out_tensor)
     }
 }
 
