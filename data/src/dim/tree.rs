@@ -169,10 +169,9 @@ impl TDim {
         if let Val(v) = self {
             return Val(*v);
         }
-    let scope = self.find_scope().unwrap();
-    let scope = scope.0.clone();
-        let locked = scope.lock();
-        let scope = locked.borrow();
+        let scope = self.find_scope().unwrap();
+        let scope = scope.0.clone();
+        let scope = scope.read();
         self.clone().simplify_rec(&scope, Some(scenario))
     }
 
@@ -312,8 +311,7 @@ impl TDim {
             return self;
         };
         let scope = scope.0.clone();
-        let locked = scope.lock();
-        let scope = locked.borrow();
+        let scope = scope.read();
         let it = self.simplify_rec(&scope, None);
         let mut current: Option<TDim> = None;
         for scenario in scope.scenarios() {
@@ -665,8 +663,7 @@ impl TDim {
             return Some(*v);
         }
         let scope = self.find_scope()?;
-        let data = scope.0.lock();
-        let data = data.borrow();
+        let data = scope.0.read();
         self.inclusive_bound(&data, false)
     }
 
@@ -675,8 +672,7 @@ impl TDim {
             return Some(*v);
         }
         let scope = self.find_scope()?;
-        let data = scope.0.lock();
-        let data = data.borrow();
+        let data = scope.0.read();
         self.inclusive_bound(&data, true)
     }
 
@@ -685,8 +681,7 @@ impl TDim {
             return *v >= 0;
         }
         let Some(scope) = self.find_scope() else { return false };
-        let data = scope.0.lock();
-        let data = data.borrow();
+        let data = scope.0.read();
         data.prove_positive_or_zero(self)
     }
 
@@ -797,9 +792,9 @@ impl TDim {
     #[allow(clippy::mutable_key_type)]
     pub fn symbols(&self) -> std::collections::HashSet<Symbol> {
         if let Some(scope) = self.find_scope() {
-            let lock = scope.0.lock();
-            if let Some(cached) = lock.borrow().symbols_cache_get(self) {
-                return cached;
+            let lock = scope.0.read();
+            if let Some(cached) = lock.symbols_cache_get(self) {
+                return (*cached).clone();
             }
             drop(lock);
             let computed = match self {
@@ -814,8 +809,8 @@ impl TDim {
                 MulInt(_, a) => a.symbols(),
                 Div(a, _) => a.symbols(),
             };
-            let lock = scope.0.lock();
-            lock.borrow().symbols_cache_put(self.clone(), computed.clone());
+            let lock = scope.0.read();
+            lock.symbols_cache_put(self.clone(), computed.clone());
             return computed;
         }
         match self {
