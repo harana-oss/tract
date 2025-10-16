@@ -81,22 +81,6 @@ pub struct LinearClassifier {
 }
 
 impl LinearClassifier {
-    #[inline(always)]
-    fn tensor1_from_vec_string(v: Vec<String>) -> TractResult<Tensor> {
-        let len = v.len();
-        let mut t = unsafe { Tensor::uninitialized::<String>(&[len]) }?;
-        t.as_slice_mut::<String>()?.clone_from_slice(&v);
-        Ok(t)
-    }
-
-    #[inline(always)]
-    fn tensor1_from_vec_i64(v: Vec<i64>) -> TractResult<Tensor> {
-        let len = v.len();
-        let mut t = unsafe { Tensor::uninitialized::<i64>(&[len]) }?;
-        t.as_slice_mut::<i64>()?.clone_from_slice(&v);
-        Ok(t)
-    }
-
     pub fn n_classes(&self) -> usize {
         self.data.labels.len()
     }
@@ -211,12 +195,12 @@ impl LinearClassifier {
         if let Some(ref lbls) = self.data.labels_str {
             let mapped: Vec<String> =
                 argmax.iter().map(|&i| lbls.get(i).cloned().unwrap_or_default()).collect();
-            return Self::tensor1_from_vec_string(mapped);
+            return Ok(tensor1(&mapped));
         }
         if let Some(ref lbls) = self.data.labels_i64 {
             let mapped: Vec<i64> =
                 argmax.iter().map(|&i| lbls.get(i).copied().unwrap_or(0)).collect();
-            return Self::tensor1_from_vec_i64(mapped);
+            return Ok(tensor1(&mapped));
         }
         match self.data.labels.datum_type() {
             DatumType::String => {
@@ -225,13 +209,13 @@ impl LinearClassifier {
                     .iter()
                     .map(|&i| label_slice.get(i).cloned().unwrap_or_default())
                     .collect();
-                Self::tensor1_from_vec_string(mapped)
+                Ok(tensor1(&mapped))
             }
             DatumType::I64 => {
                 let label_slice = self.data.labels.as_slice::<i64>()?;
                 let mapped: Vec<i64> =
                     argmax.iter().map(|&i| label_slice.get(i).copied().unwrap_or(0)).collect();
-                Self::tensor1_from_vec_i64(mapped)
+                Ok(tensor1(&mapped))
             }
             other => bail!("Unsupported label type: {:?}", other),
         }
@@ -561,25 +545,23 @@ impl LinearClassifier {
         let data = scores.as_slice::<f32>()?;
         let argmax_indices = argmax::argmax_rows(data, n, e);
 
-        let labels = if self.data.labels.datum_type() == DatumType::String {
+        if self.data.labels.datum_type() == DatumType::String {
             let label_slice = self.data.labels.as_slice::<String>()?;
             let mapped: Vec<String> = argmax_indices
                 .iter()
                 .map(|&idx| label_slice.get(idx).cloned().unwrap_or_default())
                 .collect();
-            Self::tensor1_from_vec_string(mapped)?
+            Ok(tensor1(&mapped))
         } else if self.data.labels.datum_type() == DatumType::I64 {
             let label_slice = self.data.labels.as_slice::<i64>()?;
             let mapped: Vec<i64> = argmax_indices
                 .iter()
                 .map(|&idx| label_slice.get(idx).copied().unwrap_or(0))
                 .collect();
-            Self::tensor1_from_vec_i64(mapped)?
+            Ok(tensor1(&mapped))
         } else {
             bail!("Unsupported label type: {:?}", self.data.labels.datum_type())
-        };
-
-        Ok(labels)
+        }
     }
 }
 

@@ -1,9 +1,10 @@
 use itertools::Itertools;
-use parking_lot::ReentrantMutex;
+use parking_lot::{ReentrantMutex, RwLock};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display};
 use std::sync::{Arc, OnceLock, Weak};
+use std::sync::atomic::{AtomicU64, Ordering};
 use string_interner::DefaultStringInterner;
 use string_interner::Symbol as _;
 
@@ -12,8 +13,30 @@ use crate::TractResult;
 use super::parse::parse_assertion;
 use super::{Assertion, TDim, parse_tdim};
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SymbolScope(pub Arc<ReentrantMutex<RefCell<SymbolScopeData>>>);
+
+// Global registry to map lightweight scope ids to their underlying scope storage.
+// This allows Symbol to hold a Copy-able scope id instead of a Weak and keep clone cheap.
+static SCOPE_REGISTRY: OnceLock<RwLock<HashMap<u64, Weak<ReentrantMutex<RefCell<SymbolScopeData>>>>>> = OnceLock::new();
+static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn scope_registry() -> &'static RwLock<HashMap<u64, Weak<ReentrantMutex<RefCell<SymbolScopeData>>>>> {
+    SCOPE_REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+impl Default for SymbolScope {
+    fn default() -> Self {
+        let id = NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
+        let data = SymbolScopeData { id, ..Default::default() };
+        let arc = Arc::new(ReentrantMutex::new(RefCell::new(data)));
+        // Register a Weak handle so dropping a scope isn't prevented by the registry.
+        scope_registry().write().insert(id, Arc::downgrade(&arc));
+        SymbolScope(arc)
+    }
+}
+
+// Note: No Drop for SymbolScope to keep existing move semantics elsewhere in the codebase.
 
 impl PartialEq for SymbolScope {
     fn eq(&self, other: &Self) -> bool {
@@ -25,6 +48,8 @@ impl Eq for SymbolScope {}
 
 #[derive(Default)]
 pub struct SymbolScopeData {
+    // Lightweight id for this scope so that Symbols can store it as Copy.
+    id: u64,
     table: DefaultStringInterner,
     assertions: Vec<Assertion>,
     scenarios: Vec<(String, Vec<Assertion>)>,
@@ -35,14 +60,15 @@ impl SymbolScope {
     pub fn get(&self, name: &str) -> Option<Symbol> {
         let locked = self.0.lock();
         let locked = locked.borrow();
-        locked.table.get(name).map(|sym| Symbol(Arc::downgrade(&self.0), sym))
+        locked.table.get(name).map(|sym| Symbol(locked.id, sym))
     }
 
     pub fn sym(&self, name: &str) -> Symbol {
         let locked = self.0.lock();
         let mut locked = locked.borrow_mut();
         let sym = locked.table.get_or_intern(name);
-        Symbol(Arc::downgrade(&self.0), sym)
+        let id = locked.id;
+        Symbol(id, sym)
     }
 
     pub fn new_with_prefix(&self, prefix: &str) -> Symbol {
@@ -60,7 +86,8 @@ impl SymbolScope {
                 i += 1;
             }
         };
-        Symbol(Arc::downgrade(&self.0), sym)
+        let id = locked.id;
+        Symbol(id, sym)
     }
 
     pub fn parse_tdim(&self, input: impl AsRef<str>) -> TractResult<TDim> {
@@ -135,13 +162,10 @@ impl SymbolScope {
     }
 
     pub fn all_symbols(&self) -> Vec<Symbol> {
-        self.0
-            .lock()
-            .borrow()
-            .table
-            .into_iter()
-            .map(|is| Symbol(Arc::downgrade(&self.0), is.0))
-            .collect()
+        let lock = self.0.lock();
+        let lock = lock.borrow();
+        let id = lock.id;
+        lock.table.into_iter().map(|is| Symbol(id, is.0)).collect()
     }
 
     pub fn guess_scenario(&self, values: &SymbolValues) -> TractResult<Option<usize>> {
@@ -310,8 +334,8 @@ impl fmt::Debug for SymbolScope {
     }
 }
 
-#[derive(Clone)]
-pub struct Symbol(Weak<ReentrantMutex<RefCell<SymbolScopeData>>>, string_interner::DefaultSymbol);
+#[derive(Copy, Clone)]
+pub struct Symbol(u64, string_interner::DefaultSymbol);
 
 impl Eq for Symbol {}
 
@@ -323,7 +347,25 @@ impl PartialEq for Symbol {
 
 impl Symbol {
     pub fn scope(&self) -> Option<SymbolScope> {
-        self.0.upgrade().map(SymbolScope)
+        // First try a fast read to upgrade the Weak pointer.
+        {
+            let reg = scope_registry().read();
+            if let Some(w) = reg.get(&self.0) {
+                if let Some(arc) = w.upgrade() {
+                    return Some(SymbolScope(arc));
+                }
+            } else {
+                return None;
+            }
+        }
+        // If upgrade failed, the scope was dropped; clean the stale entry.
+        let mut reg = scope_registry().write();
+        if let Some(w) = reg.get(&self.0) {
+            if w.strong_count() == 0 {
+                reg.remove(&self.0);
+            }
+        }
+        None
     }
 }
 

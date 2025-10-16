@@ -169,8 +169,8 @@ impl TDim {
         if let Val(v) = self {
             return Val(*v);
         }
-        let scope = self.find_scope().unwrap();
-        let scope = scope.0;
+    let scope = self.find_scope().unwrap();
+    let scope = scope.0.clone();
         let locked = scope.lock();
         let scope = locked.borrow();
         self.clone().simplify_rec(&scope, Some(scenario))
@@ -311,7 +311,7 @@ impl TDim {
         let Some(scope) = self.find_scope() else {
             return self;
         };
-        let scope = scope.0;
+        let scope = scope.0.clone();
         let locked = scope.lock();
         let scope = locked.borrow();
         let it = self.simplify_rec(&scope, None);
