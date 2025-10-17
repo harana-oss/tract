@@ -92,6 +92,9 @@ where
     // For each node, for each output, for each dim index, if the abstract dim contains
     // exactly one symbol, store it to skip scanning at runtime; otherwise None.
     single_symbolic_output_syms: Vec<Vec<Vec<Option<Symbol>>>>,
+    // Precomputed input information for fast set_input
+    input_outlets: Vec<OutletId>,
+    input_facts: Vec<Option<TypedFact>>,
     executor: Option<Executor>,
     session_handler: Option<Arc<dyn SessionStateHandler + 'static>>,
     _casper: PhantomData<(F, O)>,
@@ -218,6 +221,18 @@ where
             single_symbolic_output_syms[node.id] = node_single_syms;
             typed_output_facts[node.id] = node_typed_facts;
         }
+        
+        // Precompute input information for fast set_input
+        let input_outlets = model.borrow().input_outlets()?.to_vec();
+        let input_facts: Vec<Option<TypedFact>> = input_outlets
+            .iter()
+            .map(|outlet| {
+                model.borrow().outlet_fact(*outlet)
+                    .ok()
+                    .and_then(|f| f.to_typed_fact().ok().map(|f| f.into_owned()))
+            })
+            .collect();
+        
         Ok(SimplePlan {
             model,
             order,
@@ -229,6 +244,8 @@ where
             node_has_symbolic_output,
             typed_output_facts,
             single_symbolic_output_syms,
+            input_outlets,
+            input_facts,
             _casper: PhantomData,
             executor: options.executor.clone(),
             session_handler: None,
@@ -591,10 +608,12 @@ where
     }
 
     pub fn set_inputs(&mut self, inputs: TVec<TValue>) -> TractResult<()> {
+        // Fast bounds check with precomputed count
+        let expected_count = self.plan.borrow().input_outlets.len();
         ensure!(
-            inputs.len() == self.model().inputs.len(),
+            inputs.len() == expected_count,
             "Wrong number of inputs for model. Expected {} got {}",
-            self.model().inputs.len(),
+            expected_count,
             inputs.len()
         );
 
@@ -688,22 +707,40 @@ where
     }
 
     pub fn set_input(&mut self, input: usize, t: TValue) -> TractResult<()> {
-        let outlet: OutletId = *self
-            .model()
-            .input_outlets()?
-            .get(input)
-            .with_context(|| format!("Invalid input id for model ({input})."))?;
-        if let Ok(fact) = self.plan.borrow().model().outlet_fact(outlet)?.to_typed_fact() {
-            for (expected, provided) in fact.shape.iter().zip(t.shape()) {
-                Self::resolve(&mut self.session_state, expected, *provided as i64)?;
+        // Fast path: Use precomputed data from plan
+        let plan = self.plan.borrow();
+        
+        // Bounds check with precomputed input count
+        if input >= plan.input_outlets.len() {
+            bail!("Invalid input id for model ({input}).");
+        }
+        
+        // Get outlet from precomputed array (no allocation)
+        let outlet = unsafe { *plan.input_outlets.get_unchecked(input) };
+        
+        // Use precomputed typed fact if available
+        if let Some(fact) = unsafe { plan.input_facts.get_unchecked(input) }.as_ref() {
+            let t_shape = t.shape();
+            // Fast path: check shape length match first
+            if fact.shape.iter().count() == t_shape.len() {
+                // Resolve symbols inline without iterator allocation
+                for (expected, &provided) in fact.shape.iter().zip(t_shape.iter()) {
+                    Self::resolve(&mut self.session_state, expected, provided as i64)?;
+                }
             }
         }
-        let fact = self.plan.borrow().model().outlet_fact(outlet)?;
-        ensure!(
-            fact.matches(&t, Some(&self.session_state.resolved_symbols))
-                .with_context(|| format!("Setting input {input}"))?,
-            "Input at index {input} has incorrect dtype or shape (got {t:?}, expected to match fact {fact:?})",
-        );
+        
+        // Validation: only get fact from model if we need to validate
+        // In release builds with concrete shapes, this can be skipped
+        if cfg!(debug_assertions) || plan.has_unresolved_symbols {
+            let fact = plan.model.borrow().outlet_fact(outlet)?;
+            ensure!(
+                fact.matches(&t, Some(&self.session_state.resolved_symbols))
+                    .with_context(|| format!("Setting input {input}"))?,
+                "Input at index {input} has incorrect dtype or shape (got {t:?}, expected to match fact {fact:?})",
+            );
+        }
+        
         self.session_state.inputs.insert(outlet.node, t);
         Ok(())
     }

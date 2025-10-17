@@ -200,6 +200,36 @@
 			"args": [
 				"check"
 			]
+		},
+		{
+			"label": "cargo check data (scenario cache)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check workspace (scenario cache)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			]
+		},
+		{
+			"label": "cargo check workspace (symbol resolution caching)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"problemMatcher": [
+				"$rustc"
+			],
+			"group": "build"
 		}
 	]
 }
