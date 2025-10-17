@@ -115,31 +115,73 @@ impl TDim {
         if let Val(v) = self { Some(*v) } else { None }
     }
 
+    #[inline]
     pub fn eval_to_i64(&self, values: &SymbolValues) -> TractResult<i64> {
         match self {
             Sym(sym) => {
-                let Some(v) = values.get(sym) else {
+                if let Some(v) = values.get(sym) {
+                    Ok(v)
+                } else {
                     bail!(TooEarly::UndeterminedSymbol(self.clone()))
-                };
-                Ok(v)
+                }
             }
             Val(v) => Ok(*v),
             Add(terms) => {
-                terms.iter().try_fold(0, |acc, it| it.eval_to_i64(values).map(|x| acc + x))
+                let mut acc: i64 = 0;
+                for t in terms {
+                    acc += t.eval_to_i64(values)?;
+                }
+                Ok(acc)
             }
             Mul(terms) => {
-                terms.iter().try_fold(1, |acc, it| it.eval_to_i64(values).map(|x| acc * x))
+                let mut acc: i64 = 1;
+                for t in terms {
+                    let v = t.eval_to_i64(values)?;
+                    if v == 0 {
+                        return Ok(0);
+                    }
+                    acc *= v;
+                }
+                Ok(acc)
             }
-            Min(terms) => terms
-                .iter()
-                .try_fold(i64::MAX, |acc, it| it.eval_to_i64(values).map(|x| acc.min(x))),
-            Max(terms) => terms
-                .iter()
-                .try_fold(i64::MIN, |acc, it| it.eval_to_i64(values).map(|x| acc.max(x))),
-            Broadcast(terms) => terms.iter().try_fold(1i64, |acc, it| {
-                it.eval_to_i64(values)
-                    .and_then(|x| ((acc as usize).broadcast(x as usize)).map(|x| x as i64))
-            }),
+            Min(terms) => {
+                let mut acc: i64 = i64::MAX;
+                for t in terms {
+                    let v = t.eval_to_i64(values)?;
+                    if v < acc {
+                        acc = v;
+                    }
+                }
+                Ok(acc)
+            }
+            Max(terms) => {
+                let mut acc: i64 = i64::MIN;
+                for t in terms {
+                    let v = t.eval_to_i64(values)?;
+                    if v > acc {
+                        acc = v;
+                    }
+                }
+                Ok(acc)
+            }
+            Broadcast(terms) => {
+                // Fast path common broadcast cases to avoid calling broadcast() unnecessarily.
+                let mut acc: usize = 1;
+                for t in terms {
+                    let x = t.eval_to_i64(values)? as usize;
+                    if x == acc || x == 1 {
+                        // no-op
+                        continue;
+                    }
+                    if acc == 1 {
+                        acc = x;
+                        continue;
+                    }
+                    // Defer to broadcast check for general case
+                    acc = acc.broadcast(x)?;
+                }
+                Ok(acc as i64)
+            }
             Div(a, q) => Ok(a.eval_to_i64(values)? / *q as i64),
             MulInt(p, a) => Ok(a.eval_to_i64(values)? * *p),
         }
