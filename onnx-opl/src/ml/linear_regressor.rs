@@ -104,11 +104,7 @@ impl LinearRegressorData {
             } else if bsl.len() == t {
                 intercepts_vec = Some(bsl.to_vec().into());
             } else {
-                bail!(
-                    "Unsupported intercepts length {}, expected 1 or {}",
-                    bsl.len(),
-                    t
-                );
+                bail!("Unsupported intercepts length {}, expected 1 or {}", bsl.len(), t);
             }
         }
         Ok(Self {

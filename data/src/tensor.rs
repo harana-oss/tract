@@ -10,7 +10,7 @@ use itertools::{Itertools, izip};
 use ndarray::prelude::*;
 #[cfg(feature = "complex")]
 use num_complex::Complex;
-use num_traits::{Float, Zero};
+use num_traits::Float;
 use std::borrow::Cow;
 use std::fmt;
 use std::hash::Hash;

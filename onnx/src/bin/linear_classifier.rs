@@ -36,7 +36,7 @@ fn init_thread_pool() {
 
 fn main() {
     // Ensure Rayon worker threads are configured before any parallel work.
-    init_thread_pool();
+    //init_thread_pool();
 
     // Configuration via environment variables (same as the benchmark).
     // Required:

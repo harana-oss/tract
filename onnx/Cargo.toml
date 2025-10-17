@@ -56,6 +56,10 @@ harness = false
 default = []
 getrandom-js = ["tract-onnx-opl/getrandom-js"]
 
+[profile.dev]
+debug = 2
+strip = "false"
+
 [profile.release]
 lto = "fat"
 codegen-units = 1

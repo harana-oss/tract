@@ -794,7 +794,7 @@ impl TDim {
         if let Some(scope) = self.find_scope() {
             let lock = scope.0.read();
             if let Some(cached) = lock.symbols_cache_get(self) {
-                return (*cached).clone();
+                return cached;
             }
             drop(lock);
             let computed = match self {

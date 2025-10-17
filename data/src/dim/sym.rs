@@ -1,26 +1,32 @@
 use dashmap::DashMap;
 use itertools::Itertools;
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use string_interner::DefaultStringInterner;
 use string_interner::Symbol as _;
+// (previous qcell usage removed)
 
 use crate::TractResult;
 
 use super::parse::parse_assertion;
 use super::{Assertion, TDim, parse_tdim};
 
+type ScopeId = u64;
+type PerScopeSymbolsCache = HashMap<super::TDim, HashSet<Symbol>>;
+
 #[derive(Clone)]
 pub struct SymbolScope(pub Arc<RwLock<SymbolScopeData>>);
 
-static SCOPE_REGISTRY: OnceLock<DashMap<u64, Weak<RwLock<SymbolScopeData>>>> = OnceLock::new();
+static SCOPE_REGISTRY: OnceLock<DashMap<u64, SymbolScope>> = OnceLock::new();
 static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
 
-fn scope_registry() -> &'static DashMap<u64, Weak<RwLock<SymbolScopeData>>> {
-    SCOPE_REGISTRY.get_or_init(DashMap::new)
+thread_local! {
+    static TLS_SCOPE_CACHE: RefCell<HashMap<u64, SymbolScope>> = RefCell::new(HashMap::new());
+    static TLS_SYMBOLS_CACHE: RefCell<HashMap<ScopeId, PerScopeSymbolsCache>> = RefCell::new(HashMap::new());
 }
 
 impl Default for SymbolScope {
@@ -28,7 +34,11 @@ impl Default for SymbolScope {
         let id = NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
         let data = SymbolScopeData { id, ..Default::default() };
         let arc = Arc::new(RwLock::new(data));
-        scope_registry().insert(id, Arc::downgrade(&arc));
+        let scope = SymbolScope(Arc::clone(&arc));
+        SCOPE_REGISTRY.get_or_init(DashMap::new).insert(id, scope.clone());
+        TLS_SCOPE_CACHE.with(|c| {
+            c.borrow_mut().insert(id, scope);
+        });
         SymbolScope(arc)
     }
 }
@@ -47,7 +57,6 @@ pub struct SymbolScopeData {
     table: DefaultStringInterner,
     assertions: Vec<Assertion>,
     scenarios: Vec<(String, Vec<Assertion>)>,
-    symbols_cache: DashMap<super::TDim, Arc<HashSet<Symbol>>>,
 }
 
 impl SymbolScope {
@@ -205,12 +214,18 @@ impl SymbolScopeData {
         self.table.resolve(sym.1).map(f)
     }
 
-    pub(crate) fn symbols_cache_get(&self, key: &super::TDim) -> Option<Arc<HashSet<Symbol>>> {
-        self.symbols_cache.get(key).map(|v| Arc::clone(&v))
+    pub(crate) fn symbols_cache_get(&self, key: &super::TDim) -> Option<HashSet<Symbol>> {
+        let id = self.id as ScopeId;
+        TLS_SYMBOLS_CACHE.with(|c| c.borrow().get(&id).and_then(|m| m.get(key).cloned()))
     }
 
     pub(crate) fn symbols_cache_put(&self, key: super::TDim, value: HashSet<Symbol>) {
-        self.symbols_cache.insert(key, Arc::new(value));
+        let id = self.id as ScopeId;
+        TLS_SYMBOLS_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            let per_scope = cache.entry(id).or_insert_with(HashMap::new);
+            per_scope.insert(key, value);
+        });
     }
 
     #[allow(clippy::mutable_key_type)]
@@ -291,18 +306,20 @@ impl PartialEq for Symbol {
 
 impl Symbol {
     pub fn scope(&self) -> Option<SymbolScope> {
-        let entry = scope_registry().get(&self.0)?;
-        let w = entry.value();
+        let id = self.0;
 
-        if let Some(arc) = w.upgrade() {
-            return Some(SymbolScope(arc));
-        }
-
-        if w.strong_count() == 0 {
-            drop(entry);
-            scope_registry().remove(&self.0);
-        }
-        None
+        TLS_SCOPE_CACHE.with(|c| {
+            if let Some(scope) = { c.borrow().get(&id).cloned() } {
+                return Some(scope);
+            }
+            if let Some(entry) = SCOPE_REGISTRY.get_or_init(DashMap::new).get(&id) {
+                let scope = entry.value().clone();
+                c.borrow_mut().insert(id, scope.clone());
+                Some(scope)
+            } else {
+                None
+            }
+        })
     }
 }
 
