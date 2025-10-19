@@ -97,6 +97,8 @@ where
     input_facts: Vec<Option<TypedFact>>,
     executor: Option<Executor>,
     session_handler: Option<Arc<dyn SessionStateHandler + 'static>>,
+    // If true, we can skip even creating a SessionState and evaluate directly from provided inputs
+    super_fast: bool,
     _casper: PhantomData<(F, O)>,
 }
 
@@ -221,25 +223,33 @@ where
             single_symbolic_output_syms[node.id] = node_single_syms;
             typed_output_facts[node.id] = node_typed_facts;
         }
-        
+
         // Precompute input information for fast set_input
         let input_outlets = model.borrow().input_outlets()?.to_vec();
         let input_facts: Vec<Option<TypedFact>> = input_outlets
             .iter()
             .map(|outlet| {
-                model.borrow().outlet_fact(*outlet)
+                model
+                    .borrow()
+                    .outlet_fact(*outlet)
                     .ok()
                     .and_then(|f| f.to_typed_fact().ok().map(|f| f.into_owned()))
             })
             .collect();
-        
+
+        // super_fast requires: no symbols, <=2 non-const nodes, all nodes stateless.
+        let model_ref = model.borrow();
+        let all_stateless = order.iter().all(|&n| model_ref.node(n).op().is_stateless());
+        let super_fast = symbols.is_empty() && order.len() <= 2 && all_stateless;
+        let has_unresolved_symbols = !symbols.is_empty();
+        let symbols_vec = symbols.into_iter().collect();
         Ok(SimplePlan {
             model,
             order,
             flush_lists,
             outputs: outputs.to_vec(),
-            has_unresolved_symbols: !symbols.is_empty(),
-            symbols: symbols.into_iter().collect(),
+            has_unresolved_symbols,
+            symbols: symbols_vec,
             symbolic_output_dims,
             node_has_symbolic_output,
             typed_output_facts,
@@ -249,6 +259,7 @@ where
             _casper: PhantomData,
             executor: options.executor.clone(),
             session_handler: None,
+            super_fast,
         })
     }
 
@@ -267,12 +278,77 @@ where
     }
 
     pub fn run(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        if self.super_fast && !self.has_unresolved_symbols {
+            return self.run_super_fast(inputs);
+        }
         let mut state = SimpleState::new(self)?;
         state.run(inputs)
     }
 
     pub fn model(&self) -> &Graph<F, O> {
         self.model.borrow()
+    }
+
+    /// Ultra fast execution path for tiny, symbol-free graphs (<=2 non-const nodes).
+    /// Skips building a full `SimpleState`, skips per-input shape matching (except debug asserts),
+    /// and avoids the generic plan loop logic. Only supports graphs without unresolved symbols.
+
+    /// Super fast path: direct evaluation with no SessionState at all (only works for tiny, symbol-free, stateless chains).
+    pub fn run_super_fast(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        ensure!(
+            self.super_fast && !self.has_unresolved_symbols,
+            "run_super_fast called on non-super-fast plan"
+        );
+        if log::log_enabled!(log::Level::Warn) {
+            warn!("Using super_fast execution path ({} non-const nodes).", self.order.len());
+        }
+        let expected = self.input_outlets.len();
+        ensure!(
+            inputs.len() == expected,
+            "Wrong number of inputs (expected {expected} got {})",
+            inputs.len()
+        );
+        let model = self.model.borrow();
+        // values sized to model nodes for indexing
+        let mut values: Vec<Option<TVec<TValue>>> = vec![None; model.nodes().len()];
+        // Seed inputs: map outlet.node -> TValue
+        for (ix, t) in inputs.into_iter().enumerate() {
+            let outlet = unsafe { *self.input_outlets.get_unchecked(ix) };
+            values[outlet.node] = Some(tvec!(t));
+        }
+        // Seed consts (if any) even though super_fast expects stateless nodes, consts are stateless.
+        for n in model.nodes().iter() {
+            if let Some(k) = n.op_as::<Const>() {
+                values[n.id] = Some(tvec!(k.val().clone().into_tvalue()));
+            }
+        }
+        // Evaluate in order; all ops are stateless so we call eval_with_session with a dummy session.
+        // Provide a minimal empty SessionState (only for API compatibility), but ops should not depend on it.
+        let mut dummy_session = SessionState::default();
+        for &nid in &self.order {
+            let node = model.node(nid);
+            let mut inps: TVec<TValue> = TVec::with_capacity(node.inputs.len());
+            for i in &node.inputs {
+                let prec = values[i.node].as_ref().ok_or_else(|| {
+                    format_err!("Precursor missing for super_fast node {}", i.node)
+                })?;
+                inps.push(prec[i.slot].clone());
+            }
+            let vs = node
+                .op()
+                .eval_with_session(node.id, &mut dummy_session, inps)
+                .with_context(|| format!("Evaluating (super_fast) {node}"))?;
+            values[node.id] = Some(vs);
+        }
+        // Collect outputs
+        let mut outs = tvec![];
+        for o in &self.outputs {
+            let vs = values[o.node]
+                .as_ref()
+                .ok_or_else(|| format_err!("Output precursor missing in super_fast"))?;
+            outs.push(vs[o.slot].clone());
+        }
+        Ok(outs)
     }
 }
 
@@ -709,15 +785,15 @@ where
     pub fn set_input(&mut self, input: usize, t: TValue) -> TractResult<()> {
         // Fast path: Use precomputed data from plan
         let plan = self.plan.borrow();
-        
+
         // Bounds check with precomputed input count
         if input >= plan.input_outlets.len() {
             bail!("Invalid input id for model ({input}).");
         }
-        
+
         // Get outlet from precomputed array (no allocation)
         let outlet = unsafe { *plan.input_outlets.get_unchecked(input) };
-        
+
         // Use precomputed typed fact if available
         if let Some(fact) = unsafe { plan.input_facts.get_unchecked(input) }.as_ref() {
             let t_shape = t.shape();
@@ -729,7 +805,7 @@ where
                 }
             }
         }
-        
+
         // Validation: only get fact from model if we need to validate
         // In release builds with concrete shapes, this can be skipped
         if cfg!(debug_assertions) || plan.has_unresolved_symbols {
@@ -740,7 +816,7 @@ where
                 "Input at index {input} has incorrect dtype or shape (got {t:?}, expected to match fact {fact:?})",
             );
         }
-        
+
         self.session_state.inputs.insert(outlet.node, t);
         Ok(())
     }
@@ -891,7 +967,7 @@ where
                 .inputs
                 .iter()
                 .map(|(ix, t)| (*ix, t.clone().into_tensor()))
-                .collect(),
+                .collect::<HashMap<usize, Tensor>>(),
             resolved_symbols: self.session_state.resolved_symbols.clone(),
             scenario: self.session_state.scenario,
             tensors: self.session_state.tensors.clone(),

@@ -30,7 +30,6 @@ fn bench_linear_classifier(c: &mut Criterion) {
 
     // Load model once for shape inference
     let model = tract_onnx::onnx().model_for_path(&onnx_path).unwrap();
-    let n = model.sym("N");
 
     // Configure input and output dimensions
     let input_dim: usize = std::env::var("INPUT")
@@ -43,12 +42,12 @@ fn bench_linear_classifier(c: &mut Criterion) {
         .expect("OUTPUT must be a positive integer");
 
     let model = model
-        .with_input_fact(0, f32::fact(dims!(n, input_dim)).into())
+        .with_input_fact(0, f32::fact(dims!(1, input_dim)).into())
         .unwrap()
-        .with_output_fact(0, i64::fact(dims!(n)).into())
+        .with_output_fact(0, f32::fact(dims!(1)).into())
         .unwrap()
-        .with_output_fact(1, f32::fact(dims!(n, output_dim)).into())
-        .unwrap()
+        // .with_output_fact(1, f32::fact(dims!(1, output_dim)).into())
+        // .unwrap()
         .into_optimized()
         .unwrap();
 

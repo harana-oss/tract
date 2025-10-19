@@ -65,7 +65,7 @@ impl OpState for Load {
             .get(&self.id)
             .map_or_else(
                 || -> TractResult<TVec<TValue>> { Ok(tvec!(input.clone())) },
-                |it| {
+                |it: &Tensor| {
                     // Checks
                     ensure!(
                         it.datum_type() == input.datum_type(),
