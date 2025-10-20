@@ -21,7 +21,7 @@ fn bench_linear_classifier(c: &mut Criterion) {
     group.sample_size(10);
 
     // Ensure Rayon worker threads are configured before any parallel work.
-    thread_setup::init();
+    //thread_setup::init();
 
     let model_path = std::env::var("MODEL_PATH")
         .expect("Set MODEL_PATH to an existing .onnx file containing ai.onnx.ml.LinearClassifier");
