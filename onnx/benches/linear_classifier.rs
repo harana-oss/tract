@@ -44,10 +44,10 @@ fn bench_linear_classifier(c: &mut Criterion) {
     let model = model
         .with_input_fact(0, f32::fact(dims!(1, input_dim)).into())
         .unwrap()
-        .with_output_fact(0, f32::fact(dims!(1)).into())
+        .with_output_fact(0, i64::fact(dims!(1)).into())
         .unwrap()
-        // .with_output_fact(1, f32::fact(dims!(1, output_dim)).into())
-        // .unwrap()
+        .with_output_fact(1, f32::fact(dims!(1, output_dim)).into())
+        .unwrap()
         .into_optimized()
         .unwrap();
 
