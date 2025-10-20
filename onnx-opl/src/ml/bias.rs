@@ -86,51 +86,6 @@ pub unsafe fn add_bias_avx2_row(row: &mut [f32], bias: &[f32]) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn add_bias_avx512_row(row: &mut [f32], bias: &[f32]) {
-    use std::arch::x86_64::*;
-    log::debug!("bias: using AVX512 row path (len={})", row.len());
-    let t = row.len();
-    debug_assert_eq!(t, bias.len());
-    let mut j = 0usize;
-
-    while j + 64 <= t {
-        let s0 = _mm512_loadu_ps(row.as_ptr().add(j + 0));
-        let s1 = _mm512_loadu_ps(row.as_ptr().add(j + 16));
-        let s2 = _mm512_loadu_ps(row.as_ptr().add(j + 32));
-        let s3 = _mm512_loadu_ps(row.as_ptr().add(j + 48));
-        let b0 = _mm512_loadu_ps(bias.as_ptr().add(j + 0));
-        let b1 = _mm512_loadu_ps(bias.as_ptr().add(j + 16));
-        let b2 = _mm512_loadu_ps(bias.as_ptr().add(j + 32));
-        let b3 = _mm512_loadu_ps(bias.as_ptr().add(j + 48));
-        _mm512_storeu_ps(row.as_mut_ptr().add(j + 0), _mm512_add_ps(s0, b0));
-        _mm512_storeu_ps(row.as_mut_ptr().add(j + 16), _mm512_add_ps(s1, b1));
-        _mm512_storeu_ps(row.as_mut_ptr().add(j + 32), _mm512_add_ps(s2, b2));
-        _mm512_storeu_ps(row.as_mut_ptr().add(j + 48), _mm512_add_ps(s3, b3));
-        j += 64;
-    }
-
-    while j + 16 <= t {
-        let s = _mm512_loadu_ps(row.as_ptr().add(j));
-        let b = _mm512_loadu_ps(bias.as_ptr().add(j));
-        _mm512_storeu_ps(row.as_mut_ptr().add(j), _mm512_add_ps(s, b));
-        j += 16;
-    }
-
-    while j + 8 <= t {
-        let s = _mm256_loadu_ps(row.as_ptr().add(j));
-        let b = _mm256_loadu_ps(bias.as_ptr().add(j));
-        _mm256_storeu_ps(row.as_mut_ptr().add(j), _mm256_add_ps(s, b));
-        j += 8;
-    }
-
-    while j < t {
-        *row.get_unchecked_mut(j) += *bias.get_unchecked(j);
-        j += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
 pub unsafe fn add_scalar_bias_sse42(out: &mut [f32], bias: f32) {
     use std::arch::x86_64::*;
 
@@ -197,46 +152,6 @@ pub unsafe fn add_scalar_bias_avx2(out: &mut [f32], bias: f32) {
 }
 
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn add_scalar_bias_avx512(out: &mut [f32], bias: f32) {
-    use std::arch::x86_64::*;
-    log::debug!("bias: using AVX512 scalar path (len={})", out.len());
-    let len = out.len();
-    let bias_vec = _mm512_set1_ps(bias);
-    let mut i = 0usize;
-
-    while i + 64 <= len {
-        let v0 = _mm512_loadu_ps(out.as_ptr().add(i + 0));
-        let v1 = _mm512_loadu_ps(out.as_ptr().add(i + 16));
-        let v2 = _mm512_loadu_ps(out.as_ptr().add(i + 32));
-        let v3 = _mm512_loadu_ps(out.as_ptr().add(i + 48));
-        _mm512_storeu_ps(out.as_mut_ptr().add(i + 0), _mm512_add_ps(v0, bias_vec));
-        _mm512_storeu_ps(out.as_mut_ptr().add(i + 16), _mm512_add_ps(v1, bias_vec));
-        _mm512_storeu_ps(out.as_mut_ptr().add(i + 32), _mm512_add_ps(v2, bias_vec));
-        _mm512_storeu_ps(out.as_mut_ptr().add(i + 48), _mm512_add_ps(v3, bias_vec));
-        i += 64;
-    }
-
-    while i + 16 <= len {
-        let v = _mm512_loadu_ps(out.as_ptr().add(i));
-        _mm512_storeu_ps(out.as_mut_ptr().add(i), _mm512_add_ps(v, bias_vec));
-        i += 16;
-    }
-
-    while i + 8 <= len {
-        let v = _mm256_loadu_ps(out.as_ptr().add(i));
-        let vb = _mm256_set1_ps(bias);
-        _mm256_storeu_ps(out.as_mut_ptr().add(i), _mm256_add_ps(v, vb));
-        i += 8;
-    }
-
-    while i < len {
-        *out.get_unchecked_mut(i) += bias;
-        i += 1;
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
 pub unsafe fn add_bias_sse42_rows(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
     log::debug!("bias: using SSE4.2 rows path (n={}, t={})", n, t);
     debug_assert_eq!(out.len(), n * t);
@@ -255,18 +170,6 @@ pub unsafe fn add_bias_avx2_rows(out: &mut [f32], bias: &[f32], n: usize, t: usi
     for i in 0..n {
         let row = std::slice::from_raw_parts_mut(out.as_mut_ptr().add(i * t), t);
         add_bias_avx2_row(row, bias);
-    }
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-pub unsafe fn add_bias_avx512_rows(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
-    log::debug!("bias: using AVX512 rows path (n={}, t={})", n, t);
-    debug_assert_eq!(out.len(), n * t);
-    debug_assert_eq!(bias.len(), t);
-    for i in 0..n {
-        let row = std::slice::from_raw_parts_mut(out.as_mut_ptr().add(i * t), t);
-        add_bias_avx512_row(row, bias);
     }
 }
 
@@ -358,9 +261,7 @@ pub unsafe fn add_bias_neon_rows(out: &mut [f32], bias: &[f32], n: usize, t: usi
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn add_bias_neon_row(row: &mut [f32], bias: &[f32]) {
-    if std::is_x86_feature_detected!("avx512f") {
-        add_bias_avx512_row(row, bias)
-    } else if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") {
         add_bias_avx2_row(row, bias)
     } else {
         add_bias_sse42_row(row, bias)
@@ -370,9 +271,7 @@ pub unsafe fn add_bias_neon_row(row: &mut [f32], bias: &[f32]) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
-    if std::is_x86_feature_detected!("avx512f") {
-        add_scalar_bias_avx512(out, bias)
-    } else if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") {
         add_scalar_bias_avx2(out, bias)
     } else {
         add_scalar_bias_sse42(out, bias)
@@ -382,9 +281,7 @@ pub unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 pub unsafe fn add_bias_neon_rows(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
-    if std::is_x86_feature_detected!("avx512f") {
-        add_bias_avx512_rows(out, bias, n, t)
-    } else if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") {
         add_bias_avx2_rows(out, bias, n, t)
     } else {
         add_bias_sse42_rows(out, bias, n, t)

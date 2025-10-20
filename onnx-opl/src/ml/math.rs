@@ -31,17 +31,6 @@ unsafe fn hsum_avx(__m256: __m256) -> f32 {
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn hsum_avx512(v: __m512) -> f32 {
-    // reduce 16 lanes by splitting into two 256s
-    let hi = _mm512_extractf32x8_ps(v, 1);
-    let lo = _mm512_castps512_ps256(v);
-    let sum256 = _mm256_add_ps(hi, lo);
-    hsum_avx(sum256)
-}
-
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
 pub unsafe fn dot_sse42(x: &[f32], w: &[f32]) -> f32 {
     log::debug!("math: using SSE4.2 dot (len={})", x.len());
     debug_assert_eq!(x.len(), w.len());
@@ -122,51 +111,6 @@ pub unsafe fn dot_avx2(x: &[f32], w: &[f32]) -> f32 {
     acc0 = _mm256_add_ps(acc0, acc2);
     let mut sum = hsum_avx(acc0);
 
-    while i + 8 <= len {
-        let xv = _mm256_loadu_ps(x.as_ptr().add(i));
-        let wv = _mm256_loadu_ps(w.as_ptr().add(i));
-        let part = _mm256_mul_ps(xv, wv);
-        sum += hsum_avx(part);
-        i += 8;
-    }
-    while i < len {
-        sum += *x.get_unchecked(i) * *w.get_unchecked(i);
-        i += 1;
-    }
-    sum
-}
-
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-pub unsafe fn dot_avx512(x: &[f32], w: &[f32]) -> f32 {
-    use std::arch::x86_64::*;
-    log::debug!("math: using AVX512 dot (len={})", x.len());
-    debug_assert_eq!(x.len(), w.len());
-    let len = x.len();
-    let mut i = 0usize;
-    let mut acc0 = _mm512_setzero_ps();
-    let mut acc1 = _mm512_setzero_ps();
-
-    while i + 32 <= len {
-        let x0 = _mm512_loadu_ps(x.as_ptr().add(i + 0));
-        let w0 = _mm512_loadu_ps(w.as_ptr().add(i + 0));
-        let x1 = _mm512_loadu_ps(x.as_ptr().add(i + 16));
-        let w1 = _mm512_loadu_ps(w.as_ptr().add(i + 16));
-        acc0 = _mm512_fmadd_ps(x0, w0, acc0);
-        acc1 = _mm512_fmadd_ps(x1, w1, acc1);
-        i += 32;
-    }
-    let acc = _mm512_add_ps(acc0, acc1);
-    let mut sum = hsum_avx512(acc);
-
-    while i + 16 <= len {
-        let xv = _mm512_loadu_ps(x.as_ptr().add(i));
-        let wv = _mm512_loadu_ps(w.as_ptr().add(i));
-        let part = _mm512_mul_ps(xv, wv);
-        sum += hsum_avx512(part);
-        i += 16;
-    }
     while i + 8 <= len {
         let xv = _mm256_loadu_ps(x.as_ptr().add(i));
         let wv = _mm256_loadu_ps(w.as_ptr().add(i));
@@ -489,131 +433,6 @@ pub unsafe fn matmul_rows_avx2_contig(
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-pub unsafe fn matmul_rows_avx512_contig(
-    input: &[f32],
-    n: usize,
-    c: usize,
-    coef_row_major: &[f32],
-    e: usize,
-    out: &mut [f32],
-) {
-    use std::arch::x86_64::*;
-    log::debug!("matmul(math): using AVX512 contig row-major (n={}, c={}, e={})", n, c, e);
-    debug_assert!(input.len() >= n * c);
-    debug_assert!(coef_row_major.len() >= e * c);
-    debug_assert!(out.len() >= n * e);
-
-    for i in 0..n {
-        let row_ptr = input.as_ptr().add(i * c);
-        let out_ptr = out.as_mut_ptr().add(i * e);
-
-        let mut j = 0usize;
-        while j + 4 <= e {
-            let w0_ptr = coef_row_major.as_ptr().add((j + 0) * c);
-            let w1_ptr = coef_row_major.as_ptr().add((j + 1) * c);
-            let w2_ptr = coef_row_major.as_ptr().add((j + 2) * c);
-            let w3_ptr = coef_row_major.as_ptr().add((j + 3) * c);
-
-            let mut acc0 = _mm512_setzero_ps();
-            let mut acc1 = _mm512_setzero_ps();
-            let mut acc2 = _mm512_setzero_ps();
-            let mut acc3 = _mm512_setzero_ps();
-
-            let mut k = 0usize;
-            while k + 32 <= c {
-                let x0 = _mm512_loadu_ps(row_ptr.add(k + 0));
-                let x1 = _mm512_loadu_ps(row_ptr.add(k + 16));
-
-                let w00 = _mm512_loadu_ps(w0_ptr.add(k + 0));
-                let w01 = _mm512_loadu_ps(w0_ptr.add(k + 16));
-                acc0 = _mm512_fmadd_ps(x0, w00, acc0);
-                acc0 = _mm512_fmadd_ps(x1, w01, acc0);
-
-                let w10 = _mm512_loadu_ps(w1_ptr.add(k + 0));
-                let w11 = _mm512_loadu_ps(w1_ptr.add(k + 16));
-                acc1 = _mm512_fmadd_ps(x0, w10, acc1);
-                acc1 = _mm512_fmadd_ps(x1, w11, acc1);
-
-                let w20 = _mm512_loadu_ps(w2_ptr.add(k + 0));
-                let w21 = _mm512_loadu_ps(w2_ptr.add(k + 16));
-                acc2 = _mm512_fmadd_ps(x0, w20, acc2);
-                acc2 = _mm512_fmadd_ps(x1, w21, acc2);
-
-                let w30 = _mm512_loadu_ps(w3_ptr.add(k + 0));
-                let w31 = _mm512_loadu_ps(w3_ptr.add(k + 16));
-                acc3 = _mm512_fmadd_ps(x0, w30, acc3);
-                acc3 = _mm512_fmadd_ps(x1, w31, acc3);
-
-                k += 32;
-            }
-
-            while k + 16 <= c {
-                let x = _mm512_loadu_ps(row_ptr.add(k));
-                let w0 = _mm512_loadu_ps(w0_ptr.add(k));
-                let w1 = _mm512_loadu_ps(w1_ptr.add(k));
-                let w2 = _mm512_loadu_ps(w2_ptr.add(k));
-                let w3 = _mm512_loadu_ps(w3_ptr.add(k));
-                acc0 = _mm512_fmadd_ps(x, w0, acc0);
-                acc1 = _mm512_fmadd_ps(x, w1, acc1);
-                acc2 = _mm512_fmadd_ps(x, w2, acc2);
-                acc3 = _mm512_fmadd_ps(x, w3, acc3);
-                k += 16;
-            }
-
-            let mut s0 = hsum_avx512(acc0);
-            let mut s1 = hsum_avx512(acc1);
-            let mut s2 = hsum_avx512(acc2);
-            let mut s3 = hsum_avx512(acc3);
-            while k < c {
-                let xv = *row_ptr.add(k);
-                s0 += xv * *w0_ptr.add(k);
-                s1 += xv * *w1_ptr.add(k);
-                s2 += xv * *w2_ptr.add(k);
-                s3 += xv * *w3_ptr.add(k);
-                k += 1;
-            }
-
-            *out_ptr.add(j + 0) = s0;
-            *out_ptr.add(j + 1) = s1;
-            *out_ptr.add(j + 2) = s2;
-            *out_ptr.add(j + 3) = s3;
-
-            j += 4;
-        }
-
-        while j < e {
-            let w_ptr = coef_row_major.as_ptr().add(j * c);
-            let mut accv = _mm512_setzero_ps();
-            let mut k = 0usize;
-            while k + 32 <= c {
-                let x0 = _mm512_loadu_ps(row_ptr.add(k + 0));
-                let w0 = _mm512_loadu_ps(w_ptr.add(k + 0));
-                let x1 = _mm512_loadu_ps(row_ptr.add(k + 16));
-                let w1 = _mm512_loadu_ps(w_ptr.add(k + 16));
-                accv = _mm512_fmadd_ps(x0, w0, accv);
-                accv = _mm512_fmadd_ps(x1, w1, accv);
-                k += 32;
-            }
-            while k + 16 <= c {
-                let x = _mm512_loadu_ps(row_ptr.add(k));
-                let w = _mm512_loadu_ps(w_ptr.add(k));
-                accv = _mm512_fmadd_ps(x, w, accv);
-                k += 16;
-            }
-            let mut sum = hsum_avx512(accv);
-            while k < c {
-                sum += *row_ptr.add(k) * *w_ptr.add(k);
-                k += 1;
-            }
-            *out_ptr.add(j) = sum;
-            j += 1;
-        }
-    }
-}
-
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
 pub unsafe fn matmul_rows_sse42_contig_t(
     input: &[f32],
     n: usize,
@@ -747,88 +566,6 @@ pub unsafe fn matmul_rows_avx2_contig_t(
                 let part = _mm256_mul_ps(x, w);
                 sum += hsum_avx(part);
                 k += 8;
-            }
-            while k < c {
-                sum += *row_ptr.add(k) * *coef_col_major.as_ptr().add(k * e + j);
-                k += 1;
-            }
-            *out_ptr.add(j) = sum;
-            j += 1;
-        }
-    }
-}
-
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f,fma")]
-pub unsafe fn matmul_rows_avx512_contig_t(
-    input: &[f32],
-    n: usize,
-    c: usize,
-    coef_col_major: &[f32],
-    e: usize,
-    out: &mut [f32],
-) {
-    use std::arch::x86_64::*;
-    log::debug!("matmul(math): using AVX512 contig transposed (n={}, c={}, e={})", n, c, e);
-    debug_assert!(input.len() >= n * c);
-    debug_assert!(coef_col_major.len() >= e * c);
-    debug_assert!(out.len() >= n * e);
-
-    for i in 0..n {
-        let row_ptr = input.as_ptr().add(i * c);
-        let out_ptr = out.as_mut_ptr().add(i * e);
-
-        let mut j = 0usize;
-        while j + 16 <= e {
-            // process 16 outputs using AVX512 accumulation
-            let mut acc0 = _mm512_setzero_ps();
-            let mut k = 0usize;
-            while k + 16 <= c {
-                let x = _mm512_loadu_ps(row_ptr.add(k));
-                let w = _mm512_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
-                acc0 = _mm512_fmadd_ps(x, w, acc0);
-                k += 16;
-            }
-            while k < c {
-                let xv = _mm512_set1_ps(*row_ptr.add(k));
-                let wv = _mm512_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
-                acc0 = _mm512_fmadd_ps(xv, wv, acc0);
-                k += 1;
-            }
-            _mm512_storeu_ps(out_ptr.add(j), acc0);
-            j += 16;
-        }
-
-        // fallback chunks of 8
-        while j + 8 <= e {
-            let mut acc = _mm256_setzero_ps();
-            let mut k = 0usize;
-            while k + 8 <= c {
-                let x = _mm256_loadu_ps(row_ptr.add(k));
-                let w = _mm256_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
-                acc = _mm256_fmadd_ps(x, w, acc);
-                k += 8;
-            }
-            while k < c {
-                let xv = _mm256_broadcast_ss(&*row_ptr.add(k));
-                let wv = _mm256_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
-                acc = _mm256_fmadd_ps(xv, wv, acc);
-                k += 1;
-            }
-            _mm256_storeu_ps(out_ptr.add(j), acc);
-            j += 8;
-        }
-
-        while j < e {
-            let mut sum = 0f32;
-            let mut k = 0usize;
-            while k + 16 <= c {
-                let x = _mm512_loadu_ps(row_ptr.add(k));
-                let w = _mm512_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
-                let part = _mm512_mul_ps(x, w);
-                sum += hsum_avx512(part);
-                k += 16;
             }
             while k < c {
                 sum += *row_ptr.add(k) * *coef_col_major.as_ptr().add(k * e + j);
@@ -1360,9 +1097,7 @@ pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
-    if std::is_x86_feature_detected!("avx512f") {
-        dot_avx512(x, w)
-    } else if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") {
         dot_avx2(x, w)
     } else {
         dot_sse42(x, w)
@@ -1548,9 +1283,7 @@ pub unsafe fn matmul_rows_neon_contig(
     e: usize,
     out: &mut [f32],
 ) {
-    if std::is_x86_feature_detected!("avx512f") {
-        matmul_rows_avx512_contig(input, n, c, coef_row_major, e, out)
-    } else if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") {
         matmul_rows_avx2_contig(input, n, c, coef_row_major, e, out)
     } else {
         matmul_rows_sse42_contig(input, n, c, coef_row_major, e, out)
@@ -1644,9 +1377,7 @@ pub unsafe fn matmul_rows_neon_contig_t(
     e: usize,
     out: &mut [f32],
 ) {
-    if std::is_x86_feature_detected!("avx512f") {
-        matmul_rows_avx512_contig_t(input, n, c, coef_col_major, e, out)
-    } else if std::is_x86_feature_detected!("avx2") {
+    if std::is_x86_feature_detected!("avx2") {
         matmul_rows_avx2_contig_t(input, n, c, coef_col_major, e, out)
     } else {
         matmul_rows_sse42_contig_t(input, n, c, coef_col_major, e, out)

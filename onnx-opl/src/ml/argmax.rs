@@ -231,143 +231,6 @@ unsafe fn hmax_ps256(v: __m256) -> f32 {
     hmax_ps128(m128)
 }
 
-#[inline(always)]
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn hmax_ps512(v: __m512) -> f32 {
-    // Reduce 16 lanes: split into two 256-bit halves then reuse hmax_ps256
-    let hi = _mm512_extractf32x8_ps(v, 1);
-    let lo = _mm512_castps512_ps256(v);
-    let m256 = _mm256_max_ps(hi, lo);
-    hmax_ps256(m256)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx512f")]
-unsafe fn argmax_row_impl_avx512(row: &[f32]) -> usize {
-    use std::arch::x86_64::*;
-    let len = row.len();
-    let ptr = row.as_ptr();
-    let mut i = 0usize;
-
-    let mut best_val = core::f32::NEG_INFINITY;
-    let mut best_idx = 0usize;
-
-    // 64-wide (4x __m512) block
-    while i + 64 <= len {
-        let v0 = _mm512_loadu_ps(ptr.add(i + 0));
-        let v1 = _mm512_loadu_ps(ptr.add(i + 16));
-        let v2 = _mm512_loadu_ps(ptr.add(i + 32));
-        let v3 = _mm512_loadu_ps(ptr.add(i + 48));
-
-        let m01 = _mm512_max_ps(v0, v1);
-        let m23 = _mm512_max_ps(v2, v3);
-        let m = _mm512_max_ps(m01, m23);
-        let chunk_max = hmax_ps512(m);
-
-        if chunk_max > best_val {
-            let cmv = _mm512_set1_ps(chunk_max);
-
-            let mask0 = _mm512_cmp_ps_mask(v0, cmv, _CMP_EQ_OQ) as u32;
-            if mask0 != 0 {
-                let local = mask0.trailing_zeros() as usize; // first equal in v0
-                best_val = chunk_max;
-                best_idx = i + local;
-            } else {
-                let mask1 = _mm512_cmp_ps_mask(v1, cmv, _CMP_EQ_OQ) as u32;
-                if mask1 != 0 {
-                    let local = mask1.trailing_zeros() as usize;
-                    best_val = chunk_max;
-                    best_idx = i + 16 + local;
-                } else {
-                    let mask2 = _mm512_cmp_ps_mask(v2, cmv, _CMP_EQ_OQ) as u32;
-                    if mask2 != 0 {
-                        let local = mask2.trailing_zeros() as usize;
-                        best_val = chunk_max;
-                        best_idx = i + 32 + local;
-                    } else {
-                        let mask3 = _mm512_cmp_ps_mask(v3, cmv, _CMP_EQ_OQ) as u32;
-                        if mask3 != 0 {
-                            let local = mask3.trailing_zeros() as usize;
-                            best_val = chunk_max;
-                            best_idx = i + 48 + local;
-                        }
-                    }
-                }
-            }
-        }
-        i += 64;
-    }
-
-    // 32-wide via two 512 halves (use 256 ops under AVX-512)
-    if i + 32 <= len {
-        let v0 = _mm512_loadu_ps(ptr.add(i));
-        let v1 = _mm512_loadu_ps(ptr.add(i + 16));
-        let m = _mm512_max_ps(v0, v1);
-        let chunk_max = hmax_ps512(m);
-        if chunk_max > best_val {
-            let cmv = _mm512_set1_ps(chunk_max);
-            let mask0 = _mm512_cmp_ps_mask(v0, cmv, _CMP_EQ_OQ) as u32;
-            if mask0 != 0 {
-                let local = mask0.trailing_zeros() as usize;
-                best_val = chunk_max;
-                best_idx = i + local;
-            } else {
-                let mask1 = _mm512_cmp_ps_mask(v1, cmv, _CMP_EQ_OQ) as u32;
-                if mask1 != 0 {
-                    let local = mask1.trailing_zeros() as usize;
-                    best_val = chunk_max;
-                    best_idx = i + 16 + local;
-                }
-            }
-        }
-        i += 32;
-    }
-
-    // 16-wide
-    if i + 16 <= len {
-        let v = _mm512_loadu_ps(ptr.add(i));
-        let v_max = hmax_ps512(v);
-        if v_max > best_val {
-            let cmv = _mm512_set1_ps(v_max);
-            let mask = _mm512_cmp_ps_mask(v, cmv, _CMP_EQ_OQ) as u32;
-            if mask != 0 {
-                let local = mask.trailing_zeros() as usize;
-                best_val = v_max;
-                best_idx = i + local;
-            }
-        }
-        i += 16;
-    }
-
-    // 8-wide tail: reuse AVX2 path if available in this function
-    if i + 8 <= len {
-        let v = _mm256_loadu_ps(ptr.add(i));
-        let v_max = hmax_ps256(v);
-        if v_max > best_val {
-            let cmv = _mm256_set1_ps(v_max);
-            let mask = _mm256_movemask_ps(_mm256_cmp_ps(v, cmv, _CMP_EQ_OQ)) as u32;
-            if mask != 0 {
-                let local = mask.trailing_zeros() as usize;
-                best_val = v_max;
-                best_idx = i + local;
-            }
-        }
-        i += 8;
-    }
-
-    while i < len {
-        let v = *ptr.add(i);
-        if v > best_val {
-            best_val = v;
-            best_idx = i;
-        }
-        i += 1;
-    }
-
-    best_idx
-}
-
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn argmax_row_impl_avx2(row: &[f32]) -> usize {
@@ -481,11 +344,8 @@ unsafe fn argmax_row_impl_avx2(row: &[f32]) -> usize {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub fn argmax_row(row: &[f32]) -> usize {
-    // Prefer AVX-512 when available; else AVX2; else scalar
-    if std::is_x86_feature_detected!("avx512f") {
-        log::debug!("argmax: using AVX512 path");
-        unsafe { argmax_row_impl_avx512(row) }
-    } else if std::is_x86_feature_detected!("avx2") {
+    // Prefer AVX2 when available; else scalar
+    if std::is_x86_feature_detected!("avx2") {
         log::debug!("argmax: using AVX2 path");
         unsafe { argmax_row_impl_avx2(row) }
     } else {
