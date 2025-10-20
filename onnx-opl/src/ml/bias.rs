@@ -1,7 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-#[cfg(not(target_arch = "aarch64"))]
-compile_error!("NEON-only build: bias helpers require target_arch = aarch64");
 
+#[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -88,6 +87,7 @@ pub unsafe fn add_bias_avx2_rows(out: &mut [f32], bias: &[f32], n: usize, t: usi
 
 /// Add a per-target bias vector to a single row (length t).
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn add_bias_neon_row(row: &mut [f32], bias: &[f32]) {
     let t = row.len();
     debug_assert_eq!(t, bias.len());
@@ -127,6 +127,7 @@ pub unsafe fn add_bias_neon_row(row: &mut [f32], bias: &[f32]) {
 
 /// Add the same scalar bias to all elements of the buffer.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
     let len = out.len();
     let bias_vec = vdupq_n_f32(bias);
@@ -158,6 +159,7 @@ pub unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
 
 /// Add a bias vector (length t) to n consecutive rows stored row-major in `out`.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn add_bias_neon_rows(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
     debug_assert_eq!(out.len(), n * t);
     debug_assert_eq!(bias.len(), t);
@@ -165,4 +167,23 @@ pub unsafe fn add_bias_neon_rows(out: &mut [f32], bias: &[f32], n: usize, t: usi
         let row = std::slice::from_raw_parts_mut(out.as_mut_ptr().add(i * t), t);
         add_bias_neon_row(row, bias);
     }
+}
+
+// On x86_64, alias the NEON helpers to AVX2 implementations above.
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn add_bias_neon_row(row: &mut [f32], bias: &[f32]) {
+    add_bias_avx2_row(row, bias)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
+    add_scalar_bias_avx2(out, bias)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+pub unsafe fn add_bias_neon_rows(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
+    add_bias_avx2_rows(out, bias, n, t)
 }

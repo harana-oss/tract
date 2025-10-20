@@ -538,8 +538,7 @@ mod imp {
             Self { c, e, e_padded, tile_e, packed: aligned_buf.into() }
         }
 
-        #[inline(always)]
-        #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma")]
         pub unsafe fn gemm_rows_contig(&self, input: &[f32], n: usize, out: &mut [f32]) {
             debug_assert!(input.len() >= n * self.c);
             debug_assert!(out.len() >= n * self.e);
@@ -589,7 +588,7 @@ mod imp {
                         }
 
                         // Process k+0..k+7
-                        let x0 = _mm256_broadcast_ss(x_ptr.add(k + 0));
+                        let x0 = _mm256_broadcast_ss(&*x_ptr.add(k + 0));
                         let w00 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j + 0));
                         let w01 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j + 8));
                         let w02 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j + 16));
@@ -599,7 +598,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x0, w02, acc2);
                         acc3 = _mm256_fmadd_ps(x0, w03, acc3);
 
-                        let x1 = _mm256_broadcast_ss(x_ptr.add(k + 1));
+                        let x1 = _mm256_broadcast_ss(&*x_ptr.add(k + 1));
                         let w10 = _mm256_load_ps(self.packed.as_ptr().add((k + 1) * ep + j + 0));
                         let w11 = _mm256_load_ps(self.packed.as_ptr().add((k + 1) * ep + j + 8));
                         let w12 = _mm256_load_ps(self.packed.as_ptr().add((k + 1) * ep + j + 16));
@@ -609,7 +608,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x1, w12, acc2);
                         acc3 = _mm256_fmadd_ps(x1, w13, acc3);
 
-                        let x2 = _mm256_broadcast_ss(x_ptr.add(k + 2));
+                        let x2 = _mm256_broadcast_ss(&*x_ptr.add(k + 2));
                         let w20 = _mm256_load_ps(self.packed.as_ptr().add((k + 2) * ep + j + 0));
                         let w21 = _mm256_load_ps(self.packed.as_ptr().add((k + 2) * ep + j + 8));
                         let w22 = _mm256_load_ps(self.packed.as_ptr().add((k + 2) * ep + j + 16));
@@ -619,7 +618,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x2, w22, acc2);
                         acc3 = _mm256_fmadd_ps(x2, w23, acc3);
 
-                        let x3 = _mm256_broadcast_ss(x_ptr.add(k + 3));
+                        let x3 = _mm256_broadcast_ss(&*x_ptr.add(k + 3));
                         let w30 = _mm256_load_ps(self.packed.as_ptr().add((k + 3) * ep + j + 0));
                         let w31 = _mm256_load_ps(self.packed.as_ptr().add((k + 3) * ep + j + 8));
                         let w32 = _mm256_load_ps(self.packed.as_ptr().add((k + 3) * ep + j + 16));
@@ -629,7 +628,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x3, w32, acc2);
                         acc3 = _mm256_fmadd_ps(x3, w33, acc3);
 
-                        let x4 = _mm256_broadcast_ss(x_ptr.add(k + 4));
+                        let x4 = _mm256_broadcast_ss(&*x_ptr.add(k + 4));
                         let w40 = _mm256_load_ps(self.packed.as_ptr().add((k + 4) * ep + j + 0));
                         let w41 = _mm256_load_ps(self.packed.as_ptr().add((k + 4) * ep + j + 8));
                         let w42 = _mm256_load_ps(self.packed.as_ptr().add((k + 4) * ep + j + 16));
@@ -639,7 +638,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x4, w42, acc2);
                         acc3 = _mm256_fmadd_ps(x4, w43, acc3);
 
-                        let x5 = _mm256_broadcast_ss(x_ptr.add(k + 5));
+                        let x5 = _mm256_broadcast_ss(&*x_ptr.add(k + 5));
                         let w50 = _mm256_load_ps(self.packed.as_ptr().add((k + 5) * ep + j + 0));
                         let w51 = _mm256_load_ps(self.packed.as_ptr().add((k + 5) * ep + j + 8));
                         let w52 = _mm256_load_ps(self.packed.as_ptr().add((k + 5) * ep + j + 16));
@@ -649,7 +648,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x5, w52, acc2);
                         acc3 = _mm256_fmadd_ps(x5, w53, acc3);
 
-                        let x6 = _mm256_broadcast_ss(x_ptr.add(k + 6));
+                        let x6 = _mm256_broadcast_ss(&*x_ptr.add(k + 6));
                         let w60 = _mm256_load_ps(self.packed.as_ptr().add((k + 6) * ep + j + 0));
                         let w61 = _mm256_load_ps(self.packed.as_ptr().add((k + 6) * ep + j + 8));
                         let w62 = _mm256_load_ps(self.packed.as_ptr().add((k + 6) * ep + j + 16));
@@ -659,7 +658,7 @@ mod imp {
                         acc2 = _mm256_fmadd_ps(x6, w62, acc2);
                         acc3 = _mm256_fmadd_ps(x6, w63, acc3);
 
-                        let x7 = _mm256_broadcast_ss(x_ptr.add(k + 7));
+                        let x7 = _mm256_broadcast_ss(&*x_ptr.add(k + 7));
                         let w70 = _mm256_load_ps(self.packed.as_ptr().add((k + 7) * ep + j + 0));
                         let w71 = _mm256_load_ps(self.packed.as_ptr().add((k + 7) * ep + j + 8));
                         let w72 = _mm256_load_ps(self.packed.as_ptr().add((k + 7) * ep + j + 16));
@@ -674,10 +673,10 @@ mod imp {
 
                     // Unroll by 4
                     while k + 4 <= c {
-                        let x0 = _mm256_broadcast_ss(x_ptr.add(k + 0));
-                        let x1 = _mm256_broadcast_ss(x_ptr.add(k + 1));
-                        let x2 = _mm256_broadcast_ss(x_ptr.add(k + 2));
-                        let x3 = _mm256_broadcast_ss(x_ptr.add(k + 3));
+                        let x0 = _mm256_broadcast_ss(&*x_ptr.add(k + 0));
+                        let x1 = _mm256_broadcast_ss(&*x_ptr.add(k + 1));
+                        let x2 = _mm256_broadcast_ss(&*x_ptr.add(k + 2));
+                        let x3 = _mm256_broadcast_ss(&*x_ptr.add(k + 3));
 
                         let w00 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j + 0));
                         let w01 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j + 8));
@@ -724,7 +723,7 @@ mod imp {
 
                     // Remaining k
                     while k < c {
-                        let xv = _mm256_broadcast_ss(x_ptr.add(k));
+                        let xv = _mm256_broadcast_ss(&*x_ptr.add(k));
                         let wv0 = _mm256_load_ps(self.packed.as_ptr().add(k * ep + j + 0));
                         let wv1 = _mm256_load_ps(self.packed.as_ptr().add(k * ep + j + 8));
                         let wv2 = _mm256_load_ps(self.packed.as_ptr().add(k * ep + j + 16));
@@ -750,10 +749,10 @@ mod imp {
                     let mut k = 0usize;
 
                     while k + 4 <= c {
-                        let x0 = _mm256_broadcast_ss(x_ptr.add(k + 0));
-                        let x1 = _mm256_broadcast_ss(x_ptr.add(k + 1));
-                        let x2 = _mm256_broadcast_ss(x_ptr.add(k + 2));
-                        let x3 = _mm256_broadcast_ss(x_ptr.add(k + 3));
+                        let x0 = _mm256_broadcast_ss(&*x_ptr.add(k + 0));
+                        let x1 = _mm256_broadcast_ss(&*x_ptr.add(k + 1));
+                        let x2 = _mm256_broadcast_ss(&*x_ptr.add(k + 2));
+                        let x3 = _mm256_broadcast_ss(&*x_ptr.add(k + 3));
 
                         let w00 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j));
                         let w01 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j + 8));
@@ -778,7 +777,7 @@ mod imp {
                     }
 
                     while k < c {
-                        let xv = _mm256_broadcast_ss(x_ptr.add(k));
+                        let xv = _mm256_broadcast_ss(&*x_ptr.add(k));
                         let wv0 = _mm256_load_ps(self.packed.as_ptr().add(k * ep + j));
                         let wv1 = _mm256_load_ps(self.packed.as_ptr().add(k * ep + j + 8));
                         acc0 = _mm256_fmadd_ps(xv, wv0, acc0);
@@ -797,10 +796,10 @@ mod imp {
                     let mut k = 0usize;
 
                     while k + 4 <= c {
-                        let x0 = _mm256_broadcast_ss(x_ptr.add(k + 0));
-                        let x1 = _mm256_broadcast_ss(x_ptr.add(k + 1));
-                        let x2 = _mm256_broadcast_ss(x_ptr.add(k + 2));
-                        let x3 = _mm256_broadcast_ss(x_ptr.add(k + 3));
+                        let x0 = _mm256_broadcast_ss(&*x_ptr.add(k + 0));
+                        let x1 = _mm256_broadcast_ss(&*x_ptr.add(k + 1));
+                        let x2 = _mm256_broadcast_ss(&*x_ptr.add(k + 2));
+                        let x3 = _mm256_broadcast_ss(&*x_ptr.add(k + 3));
                         let w0 = _mm256_load_ps(self.packed.as_ptr().add((k + 0) * ep + j));
                         let w1 = _mm256_load_ps(self.packed.as_ptr().add((k + 1) * ep + j));
                         let w2 = _mm256_load_ps(self.packed.as_ptr().add((k + 2) * ep + j));
@@ -813,7 +812,7 @@ mod imp {
                     }
 
                     while k < c {
-                        let xv = _mm256_broadcast_ss(x_ptr.add(k));
+                        let xv = _mm256_broadcast_ss(&*x_ptr.add(k));
                         let wv = _mm256_load_ps(self.packed.as_ptr().add(k * ep + j));
                         acc = _mm256_fmadd_ps(xv, wv, acc);
                         k += 1;
@@ -835,8 +834,7 @@ mod imp {
             }
         }
 
-        #[inline(always)]
-        #[target_feature(enable = "avx2,fma")]
+    #[target_feature(enable = "avx2,fma")]
         pub unsafe fn gemm_rows_gather(
             &self,
             input_ptr: *const f32,

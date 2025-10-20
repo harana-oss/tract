@@ -127,7 +127,6 @@ unsafe fn argmax_row_impl(row: &[f32]) -> usize {
     best_idx
 }
 
-#[inline(always)]
 #[cfg(target_arch = "aarch64")]
 pub fn argmax_row(row: &[f32]) -> usize {
     unsafe { argmax_row_impl(row) }
@@ -232,7 +231,6 @@ unsafe fn hmax_ps256(v: __m256) -> f32 {
     hmax_ps128(m128)
 }
 
-#[inline(always)]
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn argmax_row_impl_avx2(row: &[f32]) -> usize {

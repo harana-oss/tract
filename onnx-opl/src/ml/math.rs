@@ -1,7 +1,6 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-#[cfg(not(target_arch = "aarch64"))]
-compile_error!("NEON-only build: math requires target_arch = aarch64");
 
+#[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -245,10 +244,10 @@ pub unsafe fn matmul_rows_avx2_contig_t(
             while k + 4 <= c {
                 prefetch_read_l1(row_ptr.add(k + 32), 128);
 
-                let x0 = _mm256_broadcast_ss(row_ptr.add(k + 0));
-                let x1 = _mm256_broadcast_ss(row_ptr.add(k + 1));
-                let x2 = _mm256_broadcast_ss(row_ptr.add(k + 2));
-                let x3 = _mm256_broadcast_ss(row_ptr.add(k + 3));
+                let x0 = _mm256_broadcast_ss(&*row_ptr.add(k + 0));
+                let x1 = _mm256_broadcast_ss(&*row_ptr.add(k + 1));
+                let x2 = _mm256_broadcast_ss(&*row_ptr.add(k + 2));
+                let x3 = _mm256_broadcast_ss(&*row_ptr.add(k + 3));
 
                 let w0 = _mm256_loadu_ps(coef_col_major.as_ptr().add((k + 0) * e + j));
                 let w1 = _mm256_loadu_ps(coef_col_major.as_ptr().add((k + 1) * e + j));
@@ -262,7 +261,7 @@ pub unsafe fn matmul_rows_avx2_contig_t(
                 k += 4;
             }
             while k < c {
-                let xv = _mm256_broadcast_ss(row_ptr.add(k));
+                let xv = _mm256_broadcast_ss(&*row_ptr.add(k));
                 let wv = _mm256_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
                 acc = _mm256_fmadd_ps(xv, wv, acc);
                 k += 1;

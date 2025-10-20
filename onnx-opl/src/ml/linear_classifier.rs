@@ -1,12 +1,11 @@
 #![allow(unsafe_op_in_unsafe_fn)]
-#[cfg(not(target_arch = "aarch64"))]
-compile_error!("NEON-only build: linear_classifier requires target_arch = aarch64");
 
 use super::smallvec::SmallVec;
 use crate::ml::bias;
 use crate::ml::math;
 use crate::ml::matmul::MatmulTiled;
 use crate::ml::{argmax, softmax};
+#[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};

@@ -304,7 +304,6 @@ mod imp {
 mod imp {
     use std::arch::x86_64::*;
 
-    #[inline(always)]
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
         if cols <= 1 { return; }
@@ -314,14 +313,12 @@ mod imp {
         }
     }
 
-    #[inline(always)]
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace_row(row: &mut [f32]) {
         if row.len() <= 1 { return; }
         softmax_avx(row);
     }
 
-    #[inline(always)]
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_rows_gather_into(
         input_ptr: *const f32,
@@ -343,7 +340,6 @@ mod imp {
         }
     }
 
-    #[inline(always)]
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn logistic_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
         if cols == 0 { return; }
@@ -372,7 +368,6 @@ mod imp {
     }
 
     // Core AVX2 softmax on a single row
-    #[inline(always)]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn softmax_avx(row: &mut [f32]) {
         let len = row.len();
@@ -437,7 +432,6 @@ mod imp {
     }
 
     // Vector exp approximation adapted to AVX2 using bit manipulation
-    #[inline(always)]
     #[target_feature(enable = "avx2,fma")]
     unsafe fn vexp_f32_softmax_fast_avx(x: __m256) -> __m256 {
         // clamp x >= -30
