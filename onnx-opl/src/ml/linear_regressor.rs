@@ -1,8 +1,8 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use super::smallvec::SmallVec;
-use crate::ml::matmul::MatmulTiled;
 use crate::ml::bias;
+use crate::ml::matmul::MatmulTiled;
 use crate::ml::{math, softmax};
 #[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
