@@ -369,7 +369,7 @@ pub unsafe fn matmul_rows_avx2_contig(
             while k + 32 <= c {
                 prefetch_read_l1(row_ptr.add(k + 64), 256);
                 prefetch_read_l1(w0_ptr.add(k + 64), 256);
-                
+
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
                 let x2 = _mm256_loadu_ps(row_ptr.add(k + 16));
@@ -455,7 +455,7 @@ pub unsafe fn matmul_rows_avx2_contig(
             while k + 32 <= c {
                 prefetch_read_l1(row_ptr.add(k + 64), 256);
                 prefetch_read_l1(w_ptr.add(k + 64), 256);
-                
+
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let w0 = _mm256_loadu_ps(w_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
@@ -648,7 +648,7 @@ pub unsafe fn matmul_rows_sse42_contig_t(
                 let x1 = _mm_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(x, x, 1)));
                 let x2 = _mm_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(x, x, 2)));
                 let x3 = _mm_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(x, x, 3)));
-                
+
                 acc = _mm_add_ps(acc, _mm_mul_ps(x0, w0));
                 acc = _mm_add_ps(acc, _mm_mul_ps(x1, w1));
                 acc = _mm_add_ps(acc, _mm_mul_ps(x2, w2));
@@ -1194,7 +1194,7 @@ pub unsafe fn matmul_rows_avx2_gather(
             while k + 32 <= c {
                 prefetch_read_l1(row_ptr.add(k + 64), 256);
                 prefetch_read_l1(w0_ptr.add(k + 64), 256);
-                
+
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
                 let x2 = _mm256_loadu_ps(row_ptr.add(k + 16));
@@ -1276,7 +1276,7 @@ pub unsafe fn matmul_rows_avx2_gather(
             while k + 32 <= c {
                 prefetch_read_l1(row_ptr.add(k + 64), 256);
                 prefetch_read_l1(w_ptr.add(k + 64), 256);
-                
+
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let w0 = _mm256_loadu_ps(w_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
