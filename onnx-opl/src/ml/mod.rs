@@ -1,3 +1,5 @@
+#![feature(target_feature_inline_always)]
+
 use tract_nnef::internal::*;
 
 pub mod argmax;
