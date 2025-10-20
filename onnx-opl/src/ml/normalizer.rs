@@ -1,13 +1,9 @@
-// NEON-only normalizer; restrict to aarch64 builds
+// SIMD normalizer with NEON on aarch64 and AVX2 on x86_64, plus scalar fallback
 #![allow(unsafe_op_in_unsafe_fn)]
-#[cfg(not(target_arch = "aarch64"))]
-compile_error!("NEON-only build: normalizer requires target_arch = aarch64");
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
 
-use std::arch::aarch64::*;
-
-const NEON_SMALL_FAST_C: usize = 128;
+const SMALL_FAST_C: usize = 128;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
@@ -53,7 +49,7 @@ impl Normalizer {
         let mut output = vec![0.0f32; input_slice.len()];
 
         unsafe {
-            self.eval_neon(input_slice, &mut output, outer, c);
+            self.eval_arch(input_slice, &mut output, outer, c);
         }
 
         Tensor::from_shape(shape, &output)
@@ -72,7 +68,7 @@ impl Normalizer {
         ensure!(input.len() == output.len());
         ensure!(input.len() == outer * c);
         unsafe {
-            self.eval_neon(input, output, outer, c);
+            self.eval_arch(input, output, outer, c);
         }
         Ok(())
     }
@@ -84,11 +80,55 @@ impl Normalizer {
         unsafe {
             // Create a temporary immutable alias to the same memory to satisfy the API
             let input_alias = std::slice::from_raw_parts(data.as_ptr(), data.len());
-            self.eval_neon(input_alias, data, outer, c);
+            self.eval_arch(input_alias, data, outer, c);
         }
         Ok(())
     }
 
+    // Architecture-dispatched SIMD core
+    #[inline(always)]
+    unsafe fn eval_arch(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            self.eval_neon(input, output, outer, c)
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            self.eval_x86(input, output, outer, c)
+        }
+        #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
+        {
+            self.eval_scalar(input, output, outer, c)
+        }
+    }
+
+    // Scalar fallback used on unsupported arches or when AVX2 unavailable
+    #[inline(always)]
+    unsafe fn eval_scalar(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
+        const EPS: f32 = 1e-12;
+        for i in 0..outer {
+            let offset = i * c;
+            let row = &input[offset..offset + c];
+            let out_row = &mut output[offset..offset + c];
+
+            let norm = match self.kind {
+                NormKind::Max => row.iter().copied().map(f32::abs).fold(0.0, f32::max),
+                NormKind::L1 => row.iter().copied().map(f32::abs).sum::<f32>(),
+                NormKind::L2 => row.iter().copied().map(|v| v * v).sum::<f32>(),
+            };
+
+            let scale = match self.kind {
+                NormKind::L2 => 1.0 / norm.max(EPS).sqrt(),
+                _ => 1.0 / norm.max(EPS),
+            };
+            for j in 0..c {
+                out_row[j] = row[j] * scale;
+            }
+        }
+    }
+
+    // aarch64 NEON implementation (existing)
+    #[cfg(target_arch = "aarch64")]
     unsafe fn eval_neon(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
         const EPS: f32 = 1e-12;
 
@@ -97,7 +137,7 @@ impl Normalizer {
             let row = &input[offset..offset + c];
             let out_row = &mut output[offset..offset + c];
 
-            if c <= NEON_SMALL_FAST_C {
+            if c <= SMALL_FAST_C {
                 match self.kind {
                     NormKind::Max => unsafe { self.normalize_small_max_neon(row, out_row) },
                     NormKind::L1 => unsafe { self.normalize_small_l1_neon(row, out_row) },
@@ -127,12 +167,164 @@ impl Normalizer {
         }
     }
 
+    // x86_64 AVX2 entrypoint with runtime detection
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn eval_x86(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
+        if std::is_x86_feature_detected!("avx2") {
+            self.eval_avx2(input, output, outer, c)
+        } else {
+            self.eval_scalar(input, output, outer, c)
+        }
+    }
+
+    // x86_64 AVX2 implementation
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn eval_avx2(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
+        const EPS: f32 = 1e-12;
+        for i in 0..outer {
+            let offset = i * c;
+            let row = &input[offset..offset + c];
+            let out_row = &mut output[offset..offset + c];
+
+            // For simplicity and maintainability, do a two-pass SIMD approach for small sizes too
+            let norm = match self.kind {
+                NormKind::Max => self.compute_max_norm_avx2(row),
+                NormKind::L1 => self.compute_l1_norm_avx2(row),
+                NormKind::L2 => self.compute_l2_norm_avx2(row),
+            };
+
+            let scale = match self.kind {
+                NormKind::L2 => 1.0 / norm.max(EPS).sqrt(),
+                _ => 1.0 / norm.max(EPS),
+            };
+
+            self.scale_avx2(row, out_row, scale);
+        }
+    }
+
+    // ===== Arch-specific helpers =====
+
+    // x86_64 AVX2 helpers
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn compute_max_norm_avx2(&self, slice: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let len = slice.len();
+        let mut i = 0usize;
+        let mut vmax = _mm256_set1_ps(f32::MIN);
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffffu32 as i32));
+
+        while i + 8 <= len {
+            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
+            let vabs = _mm256_and_ps(v, abs_mask);
+            vmax = _mm256_max_ps(vmax, vabs);
+            i += 8;
+        }
+
+        let mut max_val = hmax256_ps(vmax);
+        while i < len {
+            max_val = max_val.max((*slice.get_unchecked(i)).abs());
+            i += 1;
+        }
+        max_val
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn compute_l1_norm_avx2(&self, slice: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let len = slice.len();
+        let mut i = 0usize;
+        let mut vsum = _mm256_setzero_ps();
+        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffffu32 as i32));
+
+        while i + 8 <= len {
+            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
+            let vabs = _mm256_and_ps(v, abs_mask);
+            vsum = _mm256_add_ps(vsum, vabs);
+            i += 8;
+        }
+
+        let mut sum = hsum256_ps(vsum);
+        while i < len {
+            sum += (*slice.get_unchecked(i)).abs();
+            i += 1;
+        }
+        sum
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn compute_l2_norm_avx2(&self, slice: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        if std::is_x86_feature_detected!("fma") {
+            return self.compute_l2_norm_avx2_fma(slice);
+        }
+        let len = slice.len();
+        let mut i = 0usize;
+        let mut vsum = _mm256_setzero_ps();
+        while i + 8 <= len {
+            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
+            let sq = _mm256_mul_ps(v, v);
+            vsum = _mm256_add_ps(vsum, sq);
+            i += 8;
+        }
+        let mut sum = hsum256_ps(vsum);
+        while i < len {
+            let v = *slice.get_unchecked(i);
+            sum += v * v;
+            i += 1;
+        }
+        sum
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2,fma")]
+    unsafe fn compute_l2_norm_avx2_fma(&self, slice: &[f32]) -> f32 {
+        use std::arch::x86_64::*;
+        let len = slice.len();
+        let mut i = 0usize;
+        let mut vsum = _mm256_setzero_ps();
+        while i + 8 <= len {
+            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
+            vsum = _mm256_fmadd_ps(v, v, vsum);
+            i += 8;
+        }
+        let mut sum = hsum256_ps(vsum);
+        while i < len {
+            let v = *slice.get_unchecked(i);
+            sum += v * v;
+            i += 1;
+        }
+        sum
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn scale_avx2(&self, input: &[f32], output: &mut [f32], scale: f32) {
+        use std::arch::x86_64::*;
+        let len = input.len();
+        let mut i = 0usize;
+        let s = _mm256_set1_ps(scale);
+        while i + 8 <= len {
+            let v = _mm256_loadu_ps(input.as_ptr().add(i));
+            let r = _mm256_mul_ps(v, s);
+            _mm256_storeu_ps(output.as_mut_ptr().add(i), r);
+            i += 8;
+        }
+        while i < len {
+            *output.get_unchecked_mut(i) = *input.get_unchecked(i) * scale;
+            i += 1;
+        }
+    }
+    #[cfg(target_arch = "aarch64")]
     unsafe fn normalize_small_max_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
         let mut i = 0;
 
-        const MAX_CHUNKS: usize = NEON_SMALL_FAST_C / 16;
+        const MAX_CHUNKS: usize = SMALL_FAST_C / 16;
         let mut stored: [float32x4x4_t; MAX_CHUNKS] =
             [float32x4x4_t(vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
                 MAX_CHUNKS];
@@ -211,12 +403,13 @@ impl Normalizer {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn normalize_small_l1_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
         let mut i = 0;
 
-        const MAX_CHUNKS: usize = NEON_SMALL_FAST_C / 16;
+        const MAX_CHUNKS: usize = SMALL_FAST_C / 16;
         let mut stored: [float32x4x4_t; MAX_CHUNKS] =
             [float32x4x4_t(vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
                 MAX_CHUNKS];
@@ -295,12 +488,13 @@ impl Normalizer {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn normalize_small_l2_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
         let mut i = 0;
 
-        const MAX_CHUNKS: usize = NEON_SMALL_FAST_C / 16;
+        const MAX_CHUNKS: usize = SMALL_FAST_C / 16;
         let mut stored: [float32x4x4_t; MAX_CHUNKS] =
             [float32x4x4_t(vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
                 MAX_CHUNKS];
@@ -378,6 +572,7 @@ impl Normalizer {
         }
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn reciprocal_sqrt_neon(&self, x: f32) -> f32 {
         let v = vdupq_n_f32(x);
         let estimate = vrsqrteq_f32(v);
@@ -390,6 +585,7 @@ impl Normalizer {
         vgetq_lane_f32(refined2, 0)
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn compute_max_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -438,6 +634,7 @@ impl Normalizer {
         max
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn compute_l1_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -486,6 +683,7 @@ impl Normalizer {
         sum
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn compute_l2_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -531,6 +729,7 @@ impl Normalizer {
         sum
     }
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn scale_neon(&self, input: &[f32], output: &mut [f32], scale: f32) {
         let scale_vec = vdupq_n_f32(scale);
         let len = input.len();
@@ -565,19 +764,45 @@ impl Normalizer {
         }
     }
 
-    // Scalar fallbacks removed for NEON-only build
+    // Scalar fallbacks removed for NEON-only section; a generic scalar exists above
 }
 
+// aarch64 helpers
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+#[cfg(target_arch = "aarch64")]
 unsafe fn horizontal_sum_f32x4(v: float32x4_t) -> f32 {
     let pair_sum = vpaddq_f32(v, v);
     let final_sum = vpaddq_f32(pair_sum, pair_sum);
     vgetq_lane_f32(final_sum, 0)
 }
 
+#[cfg(target_arch = "aarch64")]
 unsafe fn horizontal_max_f32x4(v: float32x4_t) -> f32 {
     let pair_max = vpmaxq_f32(v, v);
     let final_max = vpmaxq_f32(pair_max, pair_max);
     vgetq_lane_f32(final_max, 0)
+}
+
+// x86_64 helpers
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hsum256_ps(v: __m256) -> f32 {
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), v);
+    tmp.iter().copied().sum()
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn hmax256_ps(v: __m256) -> f32 {
+    let mut tmp = [0f32; 8];
+    _mm256_storeu_ps(tmp.as_mut_ptr(), v);
+    tmp.iter().copied().fold(f32::MIN, f32::max)
 }
 
 impl Op for Normalizer {

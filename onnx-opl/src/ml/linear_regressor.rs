@@ -4,6 +4,7 @@ compile_error!("NEON-only build: linear_regressor requires target_arch = aarch64
 
 use super::smallvec::SmallVec;
 use crate::ml::matmul::MatmulTiled;
+use crate::ml::bias;
 use crate::ml::{math, softmax};
 use std::arch::aarch64::*;
 use std::hash::{Hash, Hasher};
@@ -145,82 +146,7 @@ impl LinearRegressorOp {
         })
     }
 
-    /// Optimized NEON-accelerated bias addition
-    #[inline(always)]
-    unsafe fn add_bias_neon(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
-        debug_assert_eq!(out.len(), n * t);
-        debug_assert_eq!(bias.len(), t);
-
-        for i in 0..n {
-            let row_ptr = out.as_mut_ptr().add(i * t);
-            let mut j = 0;
-
-            // Process 16 elements at a time
-            while j + 16 <= t {
-                let s0 = vld1q_f32(row_ptr.add(j));
-                let s1 = vld1q_f32(row_ptr.add(j + 4));
-                let s2 = vld1q_f32(row_ptr.add(j + 8));
-                let s3 = vld1q_f32(row_ptr.add(j + 12));
-                let b0 = vld1q_f32(bias.as_ptr().add(j));
-                let b1 = vld1q_f32(bias.as_ptr().add(j + 4));
-                let b2 = vld1q_f32(bias.as_ptr().add(j + 8));
-                let b3 = vld1q_f32(bias.as_ptr().add(j + 12));
-                vst1q_f32(row_ptr.add(j), vaddq_f32(s0, b0));
-                vst1q_f32(row_ptr.add(j + 4), vaddq_f32(s1, b1));
-                vst1q_f32(row_ptr.add(j + 8), vaddq_f32(s2, b2));
-                vst1q_f32(row_ptr.add(j + 12), vaddq_f32(s3, b3));
-                j += 16;
-            }
-
-            // Process 4 elements at a time
-            while j + 4 <= t {
-                let s = vld1q_f32(row_ptr.add(j));
-                let b = vld1q_f32(bias.as_ptr().add(j));
-                vst1q_f32(row_ptr.add(j), vaddq_f32(s, b));
-                j += 4;
-            }
-
-            // Scalar tail
-            while j < t {
-                *row_ptr.add(j) += *bias.as_ptr().add(j);
-                j += 1;
-            }
-        }
-    }
-
-    /// Optimized NEON-accelerated scalar bias addition
-    #[inline(always)]
-    unsafe fn add_scalar_bias_neon(out: &mut [f32], bias: f32) {
-        let len = out.len();
-        let bias_vec = vdupq_n_f32(bias);
-        let mut i = 0;
-
-        // Process 16 elements at a time
-        while i + 16 <= len {
-            let v0 = vld1q_f32(out.as_ptr().add(i));
-            let v1 = vld1q_f32(out.as_ptr().add(i + 4));
-            let v2 = vld1q_f32(out.as_ptr().add(i + 8));
-            let v3 = vld1q_f32(out.as_ptr().add(i + 12));
-            vst1q_f32(out.as_mut_ptr().add(i), vaddq_f32(v0, bias_vec));
-            vst1q_f32(out.as_mut_ptr().add(i + 4), vaddq_f32(v1, bias_vec));
-            vst1q_f32(out.as_mut_ptr().add(i + 8), vaddq_f32(v2, bias_vec));
-            vst1q_f32(out.as_mut_ptr().add(i + 12), vaddq_f32(v3, bias_vec));
-            i += 16;
-        }
-
-        // Process 4 elements at a time
-        while i + 4 <= len {
-            let v = vld1q_f32(out.as_ptr().add(i));
-            vst1q_f32(out.as_mut_ptr().add(i), vaddq_f32(v, bias_vec));
-            i += 4;
-        }
-
-        // Scalar tail
-        while i < len {
-            out[i] += bias;
-            i += 1;
-        }
-    }
+    // Bias helpers moved to crate::ml::bias
 
     pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
         // Normalize input view to 2D (n, c)
@@ -300,9 +226,9 @@ impl LinearRegressorOp {
             // Bias
             for row in out_slice.chunks_mut(t) {
                 if let Some(b) = &self.data.intercepts_vec {
-                    Self::add_bias_neon(row, b, 1, t);
+                    bias::add_bias_neon_row(row, b);
                 } else if self.data.bias_scalar != 0.0 {
-                    Self::add_scalar_bias_neon(row, self.data.bias_scalar);
+                    bias::add_scalar_bias_neon(row, self.data.bias_scalar);
                 }
             }
 

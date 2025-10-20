@@ -3,6 +3,7 @@
 compile_error!("NEON-only build: linear_classifier requires target_arch = aarch64");
 
 use super::smallvec::SmallVec;
+use crate::ml::bias;
 use crate::ml::math;
 use crate::ml::matmul::MatmulTiled;
 use crate::ml::{argmax, softmax};
@@ -114,82 +115,7 @@ impl LinearClassifier {
         })
     }
 
-    /// Vectorized bias addition for multiple values
-    #[inline(always)]
-    unsafe fn add_bias_neon(scores: &mut [f32], bias: &[f32]) {
-        let n = scores.len();
-        debug_assert_eq!(n, bias.len());
-        let mut i = 0;
-
-        while i + 16 <= n {
-            let s0 = vld1q_f32(scores.as_ptr().add(i));
-            let s1 = vld1q_f32(scores.as_ptr().add(i + 4));
-            let s2 = vld1q_f32(scores.as_ptr().add(i + 8));
-            let s3 = vld1q_f32(scores.as_ptr().add(i + 12));
-            let b0 = vld1q_f32(bias.as_ptr().add(i));
-            let b1 = vld1q_f32(bias.as_ptr().add(i + 4));
-            let b2 = vld1q_f32(bias.as_ptr().add(i + 8));
-            let b3 = vld1q_f32(bias.as_ptr().add(i + 12));
-            let r0 = vaddq_f32(s0, b0);
-            let r1 = vaddq_f32(s1, b1);
-            let r2 = vaddq_f32(s2, b2);
-            let r3 = vaddq_f32(s3, b3);
-            vst1q_f32(scores.as_mut_ptr().add(i), r0);
-            vst1q_f32(scores.as_mut_ptr().add(i + 4), r1);
-            vst1q_f32(scores.as_mut_ptr().add(i + 8), r2);
-            vst1q_f32(scores.as_mut_ptr().add(i + 12), r3);
-            i += 16;
-        }
-
-        while i + 4 <= n {
-            let s = vld1q_f32(scores.as_ptr().add(i));
-            let b = vld1q_f32(bias.as_ptr().add(i));
-            let r = vaddq_f32(s, b);
-            vst1q_f32(scores.as_mut_ptr().add(i), r);
-            i += 4;
-        }
-
-        while i < n {
-            scores[i] += bias[i];
-            i += 1;
-        }
-    }
-
-    /// Vectorized scalar bias addition
-    #[inline(always)]
-    unsafe fn add_scalar_bias_neon(scores: &mut [f32], bias: f32) {
-        let n = scores.len();
-        let bias_vec = vdupq_n_f32(bias);
-        let mut i = 0;
-
-        while i + 16 <= n {
-            let s0 = vld1q_f32(scores.as_ptr().add(i));
-            let s1 = vld1q_f32(scores.as_ptr().add(i + 4));
-            let s2 = vld1q_f32(scores.as_ptr().add(i + 8));
-            let s3 = vld1q_f32(scores.as_ptr().add(i + 12));
-            let r0 = vaddq_f32(s0, bias_vec);
-            let r1 = vaddq_f32(s1, bias_vec);
-            let r2 = vaddq_f32(s2, bias_vec);
-            let r3 = vaddq_f32(s3, bias_vec);
-            vst1q_f32(scores.as_mut_ptr().add(i), r0);
-            vst1q_f32(scores.as_mut_ptr().add(i + 4), r1);
-            vst1q_f32(scores.as_mut_ptr().add(i + 8), r2);
-            vst1q_f32(scores.as_mut_ptr().add(i + 12), r3);
-            i += 16;
-        }
-
-        while i + 4 <= n {
-            let s = vld1q_f32(scores.as_ptr().add(i));
-            let r = vaddq_f32(s, bias_vec);
-            vst1q_f32(scores.as_mut_ptr().add(i), r);
-            i += 4;
-        }
-
-        while i < n {
-            scores[i] += bias;
-            i += 1;
-        }
-    }
+    // Bias helpers moved to crate::ml::bias
 
     #[inline(always)]
     fn labels_from_argmax(&self, argmax: &[usize]) -> TractResult<Tensor> {
@@ -327,9 +253,9 @@ impl LinearClassifier {
             for row in scores.chunks_mut(eff_e) {
                 // Add bias
                 if let Some(bias_vec) = intercepts_eff_e {
-                    Self::add_bias_neon(row, bias_vec);
+                    bias::add_bias_neon_row(row, bias_vec);
                 } else if bias_scalar != 0.0 {
-                    Self::add_scalar_bias_neon(row, bias_scalar);
+                    bias::add_scalar_bias_neon(row, bias_scalar);
                 }
             }
 
@@ -371,7 +297,7 @@ impl LinearClassifier {
                 if let Some([b0, b1]) = binary_intercepts_2 {
                     let bias_arr = [b0, b1];
                     for row in full.chunks_mut(2) {
-                        Self::add_bias_neon(row, &bias_arr);
+                        bias::add_bias_neon_row(row, &bias_arr);
                     }
                 }
 
@@ -461,9 +387,9 @@ impl LinearClassifier {
                 // Fused bias addition
                 for row in out.chunks_mut(eff_e) {
                     if let Some(bias_vec) = intercepts_eff_e {
-                        Self::add_bias_neon(row, bias_vec);
+                        bias::add_bias_neon_row(row, bias_vec);
                     } else if eff_e == 1 && bias_scalar != 0.0 {
-                        Self::add_scalar_bias_neon(row, bias_scalar);
+                        bias::add_scalar_bias_neon(row, bias_scalar);
                     }
                 }
 
@@ -506,7 +432,7 @@ impl LinearClassifier {
                     }
 
                     if bias_scalar != 0.0 {
-                        Self::add_scalar_bias_neon(&mut compact[..n], bias_scalar);
+                        bias::add_scalar_bias_neon(&mut compact[..n], bias_scalar);
                     }
 
                     match self.post_transform {
@@ -533,7 +459,7 @@ impl LinearClassifier {
                     if let Some([b0, b1]) = binary_intercepts_2 {
                         let bias_arr = [b0, b1];
                         for row in out.chunks_mut(2) {
-                            Self::add_bias_neon(row, &bias_arr);
+                            bias::add_bias_neon_row(row, &bias_arr);
                         }
                     }
                 });

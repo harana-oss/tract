@@ -1,6 +1,7 @@
 use tract_nnef::internal::*;
 
 pub mod argmax;
+pub mod bias;
 pub mod category_mapper;
 pub mod linear_classifier;
 pub mod linear_regressor;
