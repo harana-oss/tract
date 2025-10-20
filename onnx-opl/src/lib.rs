@@ -1,5 +1,6 @@
 #![allow(clippy::len_zero)]
 #![feature(core_intrinsics)]
+#![feature(target_feature_inline_always)]
 #![cfg_attr(target_arch = "aarch64", feature(stdarch_aarch64_prefetch))]
 
 use tract_nnef::internal::*;

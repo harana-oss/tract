@@ -571,7 +571,11 @@ pub unsafe fn matmul_rows_avx2_gather_t(
 ) {
     log::debug!(
         "matmul(math): using AVX2 gather transposed (n={}, c={}, e={}, s0={}, s1={})",
-        n, c, e, s0, s1
+        n,
+        c,
+        e,
+        s0,
+        s1
     );
     debug_assert!(rowbuf.len() >= c);
     debug_assert!(coef_col_major.len() >= e * c);
@@ -621,7 +625,11 @@ pub unsafe fn matmul_rows_avx2_gather(
 ) {
     log::debug!(
         "matmul(math): using AVX2 gather row-major (n={}, c={}, e={}, s0={}, s1={})",
-        n, c, e, s0, s1
+        n,
+        c,
+        e,
+        s0,
+        s1
     );
     debug_assert!(rowbuf.len() >= c);
     debug_assert!(coef_row_major.len() >= e * c);
@@ -831,11 +839,7 @@ pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
-    if std::is_x86_feature_detected!("avx512f") {
-        dot_avx512(x, w)
-    } else {
-        dot_avx2(x, w)
-    }
+    if std::is_x86_feature_detected!("avx512f") { dot_avx512(x, w) } else { dot_avx2(x, w) }
 }
 
 #[inline(always)]

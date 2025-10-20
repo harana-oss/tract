@@ -448,7 +448,10 @@ mod imp {
         if use_avx512() {
             log::debug!(
                 "softmax: using AVX512 gather path (rows={}, cols={}, s0={}, s1={})",
-                rows, cols, s0, s1
+                rows,
+                cols,
+                s0,
+                s1
             );
             for r in 0..rows {
                 for c in 0..cols {
