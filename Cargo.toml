@@ -268,5 +268,4 @@ lto=false
 lto = true
 
 [profile.bench]
-debug = true
-
+inherits="release"
