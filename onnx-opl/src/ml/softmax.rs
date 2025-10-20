@@ -17,7 +17,9 @@ mod imp {
     // "rows" is the number of rows, "cols" is the number of columns.
     #[inline(always)]
     pub fn softmax_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
-        if cols <= 1 { return; }
+        if cols <= 1 {
+            return;
+        }
         unsafe {
             for r in 0..rows {
                 let row = &mut data[r * cols..(r + 1) * cols];
@@ -29,8 +31,12 @@ mod imp {
     /// In-place softmax on a single row buffer (helper for both contiguous and gathered paths).
     #[inline(always)]
     pub fn softmax_inplace_row(row: &mut [f32]) {
-        if row.len() <= 1 { return; }
-        unsafe { softmax_neon(row); }
+        if row.len() <= 1 {
+            return;
+        }
+        unsafe {
+            softmax_neon(row);
+        }
     }
 
     /// In-place softmax over rows loaded with explicit strides into a scratch buffer, writing back to `out`.
@@ -59,7 +65,9 @@ mod imp {
     /// In-place logistic over rows: y = 1 / (1 + exp(-x))
     #[inline(always)]
     pub fn logistic_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
-        if cols == 0 { return; }
+        if cols == 0 {
+            return;
+        }
         debug_assert_eq!(data.len(), rows * cols);
         unsafe {
             for r in 0..rows {
@@ -304,10 +312,107 @@ mod imp {
 mod imp {
     use std::arch::x86_64::*;
 
+    #[target_feature(enable = "avx512f,avx512dq,fma")]
+    unsafe fn vexp_f32_softmax_fast_avx512(x: __m512) -> __m512 {
+        // clamp x >= -30
+        let x = _mm512_max_ps(x, _mm512_set1_ps(-30.0));
+        // scaled = x * 12102203.2f
+        let scaled = _mm512_mul_ps(x, _mm512_set1_ps(12102203.2_f32));
+        // bits_i = int(scaled) + (127 << 23)
+        let mut bits_i = _mm512_cvtps_epi32(scaled);
+        let offset = _mm512_set1_epi32(127 << 23);
+        bits_i = _mm512_add_epi32(bits_i, offset);
+        let b = _mm512_castsi512_ps(bits_i);
+        // i_bits = bits & 0x7f80_0000; o_bits = bits | 0x3f80_0000
+        let i_bits = _mm512_and_si512(bits_i, _mm512_set1_epi32(0x7f80_0000u32 as i32));
+        let o_bits = _mm512_or_si512(bits_i, _mm512_set1_epi32(0x3f80_0000u32 as i32));
+        let i = _mm512_castsi512_ps(i_bits);
+        let o = _mm512_castsi512_ps(o_bits);
+        let two_i = _mm512_add_ps(i, i);
+        let prod = _mm512_mul_ps(b, o);
+        _mm512_add_ps(prod, two_i)
+    }
+
+    #[target_feature(enable = "avx512f,avx512dq,fma")]
+    unsafe fn softmax_avx512(row: &mut [f32]) {
+        let len = row.len();
+        let ptr = row.as_mut_ptr();
+
+        // Phase 1: max
+        let mut i = 0usize;
+        let mut vmax = _mm512_set1_ps(f32::NEG_INFINITY);
+        while i + 16 <= len {
+            let v = _mm512_loadu_ps(ptr.add(i));
+            vmax = _mm512_max_ps(vmax, v);
+            i += 16;
+        }
+        // reduce to scalar
+        let mut tmp = [0f32; 16];
+        _mm512_storeu_ps(tmp.as_mut_ptr(), vmax);
+        let mut max_scalar = tmp.into_iter().fold(f32::NEG_INFINITY, f32::max);
+        while i < len {
+            max_scalar = max_scalar.max(*ptr.add(i));
+            i += 1;
+        }
+
+        // Phase 2: exp and sum
+        let mut sum_vec = _mm512_setzero_ps();
+        let vbias = _mm512_set1_ps(max_scalar);
+        i = 0;
+        while i + 16 <= len {
+            let mut v = _mm512_loadu_ps(ptr.add(i));
+            v = _mm512_sub_ps(v, vbias);
+            v = vexp_f32_softmax_fast_avx512(v);
+            _mm512_storeu_ps(ptr.add(i), v);
+            sum_vec = _mm512_add_ps(sum_vec, v);
+            i += 16;
+        }
+        let mut sum = {
+            let mut t = [0f32; 16];
+            _mm512_storeu_ps(t.as_mut_ptr(), sum_vec);
+            t.into_iter().sum::<f32>()
+        };
+        while i < len {
+            let v = (*ptr.add(i) - max_scalar).exp();
+            *ptr.add(i) = v;
+            sum += v;
+            i += 1;
+        }
+
+        // Phase 3: normalize
+        let inv = 1.0 / sum;
+        let vinv = _mm512_set1_ps(inv);
+        i = 0;
+        while i + 16 <= len {
+            let v = _mm512_loadu_ps(ptr.add(i));
+            _mm512_storeu_ps(ptr.add(i), _mm512_mul_ps(v, vinv));
+            i += 16;
+        }
+        while i < len {
+            *ptr.add(i) *= inv;
+            i += 1;
+        }
+    }
+
+    #[inline(always)]
+    pub fn use_avx512() -> bool {
+        std::is_x86_feature_detected!("avx512f")
+    }
+
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
+        if use_avx512() {
+            log::debug!("softmax: using AVX512 rows path (rows={}, cols={})", rows, cols);
+            for r in 0..rows {
+                let row = &mut data[r * cols..(r + 1) * cols];
+                softmax_avx512(row);
+            }
+            return;
+        }
         log::debug!("softmax: using AVX2 rows path (rows={}, cols={})", rows, cols);
-        if cols <= 1 { return; }
+        if cols <= 1 {
+            return;
+        }
         for r in 0..rows {
             let row = &mut data[r * cols..(r + 1) * cols];
             softmax_avx(row);
@@ -316,8 +421,17 @@ mod imp {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace_row(row: &mut [f32]) {
+        if use_avx512() {
+            log::debug!("softmax: using AVX512 row path (len={})", row.len());
+            if row.len() > 1 {
+                softmax_avx512(row);
+            }
+            return;
+        }
         log::debug!("softmax: using AVX2 row path (len={})", row.len());
-        if row.len() <= 1 { return; }
+        if row.len() <= 1 {
+            return;
+        }
         softmax_avx(row);
     }
 
@@ -331,9 +445,28 @@ mod imp {
         out: &mut [f32],
         rowbuf: &mut [f32],
     ) {
+        if use_avx512() {
+            log::debug!(
+                "softmax: using AVX512 gather path (rows={}, cols={}, s0={}, s1={})",
+                rows, cols, s0, s1
+            );
+            for r in 0..rows {
+                for c in 0..cols {
+                    let off = r as isize * s0 + c as isize * s1;
+                    rowbuf[c] = *input_ptr.offset(off);
+                }
+                let row = &mut rowbuf[..cols];
+                softmax_avx512(row);
+                out[r * cols..(r + 1) * cols].copy_from_slice(row);
+            }
+            return;
+        }
         log::debug!(
             "softmax: using AVX2 gather path (rows={}, cols={}, s0={}, s1={})",
-            rows, cols, s0, s1
+            rows,
+            cols,
+            s0,
+            s1
         );
         for r in 0..rows {
             for c in 0..cols {
@@ -348,7 +481,9 @@ mod imp {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn logistic_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
-        if cols == 0 { return; }
+        if cols == 0 {
+            return;
+        }
         debug_assert_eq!(data.len(), rows * cols);
         for r in 0..rows {
             let row = &mut data[r * cols..(r + 1) * cols];
@@ -465,7 +600,9 @@ mod imp {
 compile_error!("softmax is only implemented for aarch64 (NEON) and x86_64 (AVX2/FMA)");
 
 // Re-export unified API from arch module
-pub use imp::{logistic_inplace_rows, softmax_inplace_row, softmax_inplace_rows, softmax_rows_gather_into};
+pub use imp::{
+    logistic_inplace_rows, softmax_inplace_row, softmax_inplace_rows, softmax_rows_gather_into,
+};
 
 /// Convenience wrapper that allocates a thread-local scratch row buffer and writes results into `out`.
 #[inline(always)]
