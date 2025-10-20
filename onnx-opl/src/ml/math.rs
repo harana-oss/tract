@@ -506,6 +506,7 @@ pub unsafe fn matmul_rows_avx2_gather(
 }
 
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
     debug_assert_eq!(x.len(), w.len());
     let len = x.len();
@@ -552,6 +553,13 @@ pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
     sum
 }
 
+// x86_64 shim: reuse AVX2 implementation under the same API
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
+    dot_avx2(x, w)
+}
+
 #[inline(always)]
 #[cfg(any(target_arch = "aarch64"))]
 unsafe fn prefetch_read_l1(ptr: *const f32, bytes_ahead: isize) {
@@ -571,6 +579,7 @@ unsafe fn prefetch_read_l1(ptr: *const f32, bytes_ahead: isize) {
 }
 
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn matmul_rows_neon_contig(
     input: &[f32],
     n: usize,
@@ -719,9 +728,24 @@ pub unsafe fn matmul_rows_neon_contig(
     }
 }
 
+// x86_64 shim: delegate to AVX2 row-major contig implementation
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_neon_contig(
+    input: &[f32],
+    n: usize,
+    c: usize,
+    coef_row_major: &[f32],
+    e: usize,
+    out: &mut [f32],
+) {
+    matmul_rows_avx2_contig(input, n, c, coef_row_major, e, out)
+}
+
 /// Matmul using transposed coefficients (feature-major: [c, e]).
 /// Processes output classes in chunks of 4 with NEON and broadcasts input features.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn matmul_rows_neon_contig_t(
     input: &[f32],
     n: usize,
@@ -794,8 +818,23 @@ pub unsafe fn matmul_rows_neon_contig_t(
     }
 }
 
+// x86_64 shim: delegate to AVX2 transposed-contig implementation
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_neon_contig_t(
+    input: &[f32],
+    n: usize,
+    c: usize,
+    coef_col_major: &[f32], // layout [c, e]
+    e: usize,
+    out: &mut [f32],
+) {
+    matmul_rows_avx2_contig_t(input, n, c, coef_col_major, e, out)
+}
+
 /// Matmul using transposed coefficients with a gathered (strided) input row into rowbuf.
 #[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn matmul_rows_neon_gather_t(
     input_ptr: *const f32,
     n: usize,
@@ -842,7 +881,25 @@ pub unsafe fn matmul_rows_neon_gather_t(
     }
 }
 
+// x86_64 shim: delegate to AVX2 gathered-transposed implementation
 #[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_neon_gather_t(
+    input_ptr: *const f32,
+    n: usize,
+    c: usize,
+    s0: isize,
+    s1: isize,
+    coef_col_major: &[f32], // layout [c, e]
+    e: usize,
+    out: &mut [f32],
+    rowbuf: &mut [f32],
+) {
+    matmul_rows_avx2_gather_t(input_ptr, n, c, s0, s1, coef_col_major, e, out, rowbuf)
+}
+
+#[inline(always)]
+#[cfg(target_arch = "aarch64")]
 pub unsafe fn matmul_rows_neon_gather(
     input_ptr: *const f32,
     n: usize,
@@ -1013,4 +1070,21 @@ pub unsafe fn matmul_rows_neon_gather(
             j += 1;
         }
     }
+}
+
+// x86_64 shim: delegate to AVX2 gathered row-major implementation
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_neon_gather(
+    input_ptr: *const f32,
+    n: usize,
+    c: usize,
+    s0: isize,
+    s1: isize,
+    coef_row_major: &[f32],
+    e: usize,
+    out: &mut [f32],
+    rowbuf: &mut [f32],
+) {
+    matmul_rows_avx2_gather(input_ptr, n, c, s0, s1, coef_row_major, e, out, rowbuf)
 }
