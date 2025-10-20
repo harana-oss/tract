@@ -19,7 +19,7 @@ reduce_impl_wrap!(
     }
 );
 
-#[target_feature(enable = "avx512f")]
+#[target_feature(enable = "avx")]
 unsafe fn x86_64_fma_sum_f32_32n_run(buf: &[f32]) -> f32 {
     let mut len = buf.len();
     let mut ptr = buf.as_ptr();
@@ -62,6 +62,7 @@ unsafe fn x86_64_fma_sum_f32_32n_run(buf: &[f32]) -> f32 {
     acc
 }
 
+#[target_feature(enable = "avx512f")]
 unsafe fn x86_64_avx512_sum_f32_64n_run(buf: &[f32]) -> f32 {
     let mut len = buf.len();
     let mut ptr = buf.as_ptr();
