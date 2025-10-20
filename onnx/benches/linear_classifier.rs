@@ -79,8 +79,22 @@ fn bench_linear_classifier(c: &mut Criterion) {
 
             b.iter_custom(|_| {
                 let start = Instant::now();
+                // Optional Rayon split tuning via env vars PAR_MIN_LEN / PAR_MAX_LEN
+                let (min_len, max_len) = {
+                    use std::env;
+                    let mut min = env::var("PAR_MIN_LEN").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(1);
+                    let mut max = env::var("PAR_MAX_LEN").ok().and_then(|s| s.parse::<usize>().ok()).unwrap_or(usize::MAX);
+                    if min == 0 { min = 1; }
+                    if max == 0 { max = 1; }
+                    if min > max { std::mem::swap(&mut min, &mut max); }
+                    (min, max)
+                };
 
-                (0..15_000).into_par_iter().for_each(|i| {
+                (0..15_000)
+                    .into_par_iter()
+                    .with_min_len(min_len)
+                    .with_max_len(max_len)
+                    .for_each(|i| {
                     let input_val = tensors[i].clone().into_tvalue();
                     let mut state = SimpleState::new(plan.clone()).unwrap();
                     let mut inputs = TVec::new();
