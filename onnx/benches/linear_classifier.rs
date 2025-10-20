@@ -1,4 +1,5 @@
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+use env_logger;
 
 use rand::Rng;
 use rand::SeedableRng;
@@ -17,11 +18,30 @@ mod thread_setup;
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn bench_linear_classifier(c: &mut Criterion) {
+    let _ = env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("info"),
+    )
+    .format_timestamp_millis()
+    .try_init();
+
     let mut group = c.benchmark_group("onnx_linear_classifier");
     group.sample_size(10);
 
     // Ensure Rayon worker threads are configured before any parallel work.
-    thread_setup::init();
+    // Controlled by env var THREAD_SETUP (default: enabled). Set to 0/false/no/off to disable.
+    let run_thread_setup = std::env::var("THREAD_SETUP")
+        .ok()
+        .map(|v| {
+            let v = v.to_ascii_lowercase();
+            !matches!(v.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true);
+    if run_thread_setup {
+        log::info!("thread_setup: enabled (THREAD_SETUP={:?})", std::env::var("THREAD_SETUP").ok());
+        thread_setup::init();
+    } else {
+        log::info!("thread_setup: disabled by THREAD_SETUP={:?}", std::env::var("THREAD_SETUP").ok());
+    }
 
     let model_path = std::env::var("MODEL_PATH")
         .expect("Set MODEL_PATH to an existing .onnx file containing ai.onnx.ml.LinearClassifier");
