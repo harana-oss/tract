@@ -212,7 +212,7 @@ impl Normalizer {
         use std::arch::x86_64::*;
         let len = slice.len();
         let mut i = 0usize;
-        
+
         // Use 4-way unrolling for better ILP (instruction-level parallelism)
         let mut vmax0 = _mm256_set1_ps(f32::MIN);
         let mut vmax1 = _mm256_set1_ps(f32::MIN);
@@ -226,19 +226,19 @@ impl Normalizer {
             let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
             let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
             let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-            
+
             let vabs0 = _mm256_and_ps(v0, abs_mask);
             let vabs1 = _mm256_and_ps(v1, abs_mask);
             let vabs2 = _mm256_and_ps(v2, abs_mask);
             let vabs3 = _mm256_and_ps(v3, abs_mask);
-            
+
             vmax0 = _mm256_max_ps(vmax0, vabs0);
             vmax1 = _mm256_max_ps(vmax1, vabs1);
             vmax2 = _mm256_max_ps(vmax2, vabs2);
             vmax3 = _mm256_max_ps(vmax3, vabs3);
             i += 32;
         }
-        
+
         // Reduce the 4 accumulators
         vmax0 = _mm256_max_ps(vmax0, vmax1);
         vmax2 = _mm256_max_ps(vmax2, vmax3);
@@ -253,7 +253,7 @@ impl Normalizer {
         }
 
         let mut max_val = hmax256_ps(vmax0);
-        
+
         // Scalar tail
         while i < len {
             max_val = max_val.max((*slice.get_unchecked(i)).abs());
@@ -268,7 +268,7 @@ impl Normalizer {
         use std::arch::x86_64::*;
         let len = slice.len();
         let mut i = 0usize;
-        
+
         // Use 4-way unrolling for better ILP
         let mut vsum0 = _mm256_setzero_ps();
         let mut vsum1 = _mm256_setzero_ps();
@@ -282,19 +282,19 @@ impl Normalizer {
             let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
             let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
             let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-            
+
             let vabs0 = _mm256_and_ps(v0, abs_mask);
             let vabs1 = _mm256_and_ps(v1, abs_mask);
             let vabs2 = _mm256_and_ps(v2, abs_mask);
             let vabs3 = _mm256_and_ps(v3, abs_mask);
-            
+
             vsum0 = _mm256_add_ps(vsum0, vabs0);
             vsum1 = _mm256_add_ps(vsum1, vabs1);
             vsum2 = _mm256_add_ps(vsum2, vabs2);
             vsum3 = _mm256_add_ps(vsum3, vabs3);
             i += 32;
         }
-        
+
         // Reduce the 4 accumulators
         vsum0 = _mm256_add_ps(vsum0, vsum1);
         vsum2 = _mm256_add_ps(vsum2, vsum3);
@@ -309,7 +309,7 @@ impl Normalizer {
         }
 
         let mut sum = hsum256_ps(vsum0);
-        
+
         // Scalar tail
         while i < len {
             sum += (*slice.get_unchecked(i)).abs();
@@ -327,37 +327,37 @@ impl Normalizer {
         }
         let len = slice.len();
         let mut i = 0usize;
-        
+
         // Use 4-way unrolling for better ILP
         let mut vsum0 = _mm256_setzero_ps();
         let mut vsum1 = _mm256_setzero_ps();
         let mut vsum2 = _mm256_setzero_ps();
         let mut vsum3 = _mm256_setzero_ps();
-        
+
         // Process 32 elements at a time (4 vectors of 8)
         while i + 32 <= len {
             let v0 = _mm256_loadu_ps(slice.as_ptr().add(i));
             let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
             let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
             let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-            
+
             let sq0 = _mm256_mul_ps(v0, v0);
             let sq1 = _mm256_mul_ps(v1, v1);
             let sq2 = _mm256_mul_ps(v2, v2);
             let sq3 = _mm256_mul_ps(v3, v3);
-            
+
             vsum0 = _mm256_add_ps(vsum0, sq0);
             vsum1 = _mm256_add_ps(vsum1, sq1);
             vsum2 = _mm256_add_ps(vsum2, sq2);
             vsum3 = _mm256_add_ps(vsum3, sq3);
             i += 32;
         }
-        
+
         // Reduce the 4 accumulators
         vsum0 = _mm256_add_ps(vsum0, vsum1);
         vsum2 = _mm256_add_ps(vsum2, vsum3);
         vsum0 = _mm256_add_ps(vsum0, vsum2);
-        
+
         // Process remaining 8-element chunks
         while i + 8 <= len {
             let v = _mm256_loadu_ps(slice.as_ptr().add(i));
@@ -365,9 +365,9 @@ impl Normalizer {
             vsum0 = _mm256_add_ps(vsum0, sq);
             i += 8;
         }
-        
+
         let mut sum = hsum256_ps(vsum0);
-        
+
         // Scalar tail
         while i < len {
             let v = *slice.get_unchecked(i);
@@ -383,41 +383,41 @@ impl Normalizer {
         use std::arch::x86_64::*;
         let len = slice.len();
         let mut i = 0usize;
-        
+
         // Use 4-way unrolling for better ILP with FMA
         let mut vsum0 = _mm256_setzero_ps();
         let mut vsum1 = _mm256_setzero_ps();
         let mut vsum2 = _mm256_setzero_ps();
         let mut vsum3 = _mm256_setzero_ps();
-        
+
         // Process 32 elements at a time (4 vectors of 8)
         while i + 32 <= len {
             let v0 = _mm256_loadu_ps(slice.as_ptr().add(i));
             let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
             let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
             let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-            
+
             vsum0 = _mm256_fmadd_ps(v0, v0, vsum0);
             vsum1 = _mm256_fmadd_ps(v1, v1, vsum1);
             vsum2 = _mm256_fmadd_ps(v2, v2, vsum2);
             vsum3 = _mm256_fmadd_ps(v3, v3, vsum3);
             i += 32;
         }
-        
+
         // Reduce the 4 accumulators
         vsum0 = _mm256_add_ps(vsum0, vsum1);
         vsum2 = _mm256_add_ps(vsum2, vsum3);
         vsum0 = _mm256_add_ps(vsum0, vsum2);
-        
+
         // Process remaining 8-element chunks
         while i + 8 <= len {
             let v = _mm256_loadu_ps(slice.as_ptr().add(i));
             vsum0 = _mm256_fmadd_ps(v, v, vsum0);
             i += 8;
         }
-        
+
         let mut sum = hsum256_ps(vsum0);
-        
+
         // Scalar tail
         while i < len {
             let v = *slice.get_unchecked(i);
@@ -434,26 +434,26 @@ impl Normalizer {
         let len = input.len();
         let mut i = 0usize;
         let s = _mm256_set1_ps(scale);
-        
+
         // Process 32 elements at a time (4 vectors of 8) for better throughput
         while i + 32 <= len {
             let v0 = _mm256_loadu_ps(input.as_ptr().add(i));
             let v1 = _mm256_loadu_ps(input.as_ptr().add(i + 8));
             let v2 = _mm256_loadu_ps(input.as_ptr().add(i + 16));
             let v3 = _mm256_loadu_ps(input.as_ptr().add(i + 24));
-            
+
             let r0 = _mm256_mul_ps(v0, s);
             let r1 = _mm256_mul_ps(v1, s);
             let r2 = _mm256_mul_ps(v2, s);
             let r3 = _mm256_mul_ps(v3, s);
-            
+
             _mm256_storeu_ps(output.as_mut_ptr().add(i), r0);
             _mm256_storeu_ps(output.as_mut_ptr().add(i + 8), r1);
             _mm256_storeu_ps(output.as_mut_ptr().add(i + 16), r2);
             _mm256_storeu_ps(output.as_mut_ptr().add(i + 24), r3);
             i += 32;
         }
-        
+
         // Process remaining 8-element chunks
         while i + 8 <= len {
             let v = _mm256_loadu_ps(input.as_ptr().add(i));
@@ -461,7 +461,7 @@ impl Normalizer {
             _mm256_storeu_ps(output.as_mut_ptr().add(i), r);
             i += 8;
         }
-        
+
         // Scalar tail
         while i < len {
             *output.get_unchecked_mut(i) = *input.get_unchecked(i) * scale;

@@ -8,6 +8,16 @@ use std::arch::x86_64::*;
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
+unsafe fn hsum_sse(__m128: __m128) -> f32 {
+    let shuf = _mm_movehdup_ps(__m128);
+    let sums = _mm_add_ps(__m128, shuf);
+    let shuf2 = _mm_movehl_ps(shuf, sums);
+    let result = _mm_add_ss(sums, shuf2);
+    _mm_cvtss_f32(result)
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
 unsafe fn hsum_avx(__m256: __m256) -> f32 {
     let hi = _mm256_extractf128_ps(__m256, 1);
     let lo = _mm256_castps256_ps128(__m256);
@@ -28,6 +38,54 @@ unsafe fn hsum_avx512(v: __m512) -> f32 {
     let lo = _mm512_castps512_ps256(v);
     let sum256 = _mm256_add_ps(hi, lo);
     hsum_avx(sum256)
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn dot_sse42(x: &[f32], w: &[f32]) -> f32 {
+    log::debug!("math: using SSE4.2 dot (len={})", x.len());
+    debug_assert_eq!(x.len(), w.len());
+    let len = x.len();
+    let mut i = 0usize;
+    let mut acc0 = _mm_setzero_ps();
+    let mut acc1 = _mm_setzero_ps();
+    let mut acc2 = _mm_setzero_ps();
+    let mut acc3 = _mm_setzero_ps();
+
+    while i + 16 <= len {
+        let x0 = _mm_loadu_ps(x.as_ptr().add(i + 0));
+        let w0 = _mm_loadu_ps(w.as_ptr().add(i + 0));
+        let x1 = _mm_loadu_ps(x.as_ptr().add(i + 4));
+        let w1 = _mm_loadu_ps(w.as_ptr().add(i + 4));
+        let x2 = _mm_loadu_ps(x.as_ptr().add(i + 8));
+        let w2 = _mm_loadu_ps(w.as_ptr().add(i + 8));
+        let x3 = _mm_loadu_ps(x.as_ptr().add(i + 12));
+        let w3 = _mm_loadu_ps(w.as_ptr().add(i + 12));
+
+        acc0 = _mm_add_ps(acc0, _mm_mul_ps(x0, w0));
+        acc1 = _mm_add_ps(acc1, _mm_mul_ps(x1, w1));
+        acc2 = _mm_add_ps(acc2, _mm_mul_ps(x2, w2));
+        acc3 = _mm_add_ps(acc3, _mm_mul_ps(x3, w3));
+        i += 16;
+    }
+
+    acc0 = _mm_add_ps(acc0, acc1);
+    acc2 = _mm_add_ps(acc2, acc3);
+    acc0 = _mm_add_ps(acc0, acc2);
+    let mut sum = hsum_sse(acc0);
+
+    while i + 4 <= len {
+        let xv = _mm_loadu_ps(x.as_ptr().add(i));
+        let wv = _mm_loadu_ps(w.as_ptr().add(i));
+        let part = _mm_mul_ps(xv, wv);
+        sum += hsum_sse(part);
+        i += 4;
+    }
+    while i < len {
+        sum += *x.get_unchecked(i) * *w.get_unchecked(i);
+        i += 1;
+    }
+    sum
 }
 
 #[inline(always)]
@@ -131,6 +189,153 @@ unsafe fn prefetch_read_l1(ptr: *const f32, _bytes_ahead: isize) {
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_sse42_contig(
+    input: &[f32],
+    n: usize,
+    c: usize,
+    coef_row_major: &[f32],
+    e: usize,
+    out: &mut [f32],
+) {
+    log::debug!("matmul(math): using SSE4.2 contig row-major (n={}, c={}, e={})", n, c, e);
+    debug_assert!(input.len() >= n * c);
+    debug_assert!(coef_row_major.len() >= e * c);
+    debug_assert!(out.len() >= n * e);
+
+    for i in 0..n {
+        let row_ptr = input.as_ptr().add(i * c);
+        let out_ptr = out.as_mut_ptr().add(i * e);
+
+        let mut j = 0usize;
+        while j + 4 <= e {
+            let w0_ptr = coef_row_major.as_ptr().add((j + 0) * c);
+            let w1_ptr = coef_row_major.as_ptr().add((j + 1) * c);
+            let w2_ptr = coef_row_major.as_ptr().add((j + 2) * c);
+            let w3_ptr = coef_row_major.as_ptr().add((j + 3) * c);
+
+            let mut acc0 = _mm_setzero_ps();
+            let mut acc1 = _mm_setzero_ps();
+            let mut acc2 = _mm_setzero_ps();
+            let mut acc3 = _mm_setzero_ps();
+
+            let mut k = 0usize;
+            while k + 16 <= c {
+                let x0 = _mm_loadu_ps(row_ptr.add(k + 0));
+                let x1 = _mm_loadu_ps(row_ptr.add(k + 4));
+                let x2 = _mm_loadu_ps(row_ptr.add(k + 8));
+                let x3 = _mm_loadu_ps(row_ptr.add(k + 12));
+
+                let w00 = _mm_loadu_ps(w0_ptr.add(k + 0));
+                let w01 = _mm_loadu_ps(w0_ptr.add(k + 4));
+                let w02 = _mm_loadu_ps(w0_ptr.add(k + 8));
+                let w03 = _mm_loadu_ps(w0_ptr.add(k + 12));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x0, w00));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x1, w01));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x2, w02));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x3, w03));
+
+                let w10 = _mm_loadu_ps(w1_ptr.add(k + 0));
+                let w11 = _mm_loadu_ps(w1_ptr.add(k + 4));
+                let w12 = _mm_loadu_ps(w1_ptr.add(k + 8));
+                let w13 = _mm_loadu_ps(w1_ptr.add(k + 12));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x0, w10));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x1, w11));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x2, w12));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x3, w13));
+
+                let w20 = _mm_loadu_ps(w2_ptr.add(k + 0));
+                let w21 = _mm_loadu_ps(w2_ptr.add(k + 4));
+                let w22 = _mm_loadu_ps(w2_ptr.add(k + 8));
+                let w23 = _mm_loadu_ps(w2_ptr.add(k + 12));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x0, w20));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x1, w21));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x2, w22));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x3, w23));
+
+                let w30 = _mm_loadu_ps(w3_ptr.add(k + 0));
+                let w31 = _mm_loadu_ps(w3_ptr.add(k + 4));
+                let w32 = _mm_loadu_ps(w3_ptr.add(k + 8));
+                let w33 = _mm_loadu_ps(w3_ptr.add(k + 12));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x0, w30));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x1, w31));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x2, w32));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x3, w33));
+
+                k += 16;
+            }
+
+            while k + 4 <= c {
+                let x = _mm_loadu_ps(row_ptr.add(k));
+                let w0 = _mm_loadu_ps(w0_ptr.add(k));
+                let w1 = _mm_loadu_ps(w1_ptr.add(k));
+                let w2 = _mm_loadu_ps(w2_ptr.add(k));
+                let w3 = _mm_loadu_ps(w3_ptr.add(k));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x, w0));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x, w1));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x, w2));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x, w3));
+                k += 4;
+            }
+
+            let mut s0 = hsum_sse(acc0);
+            let mut s1 = hsum_sse(acc1);
+            let mut s2 = hsum_sse(acc2);
+            let mut s3 = hsum_sse(acc3);
+            while k < c {
+                let xv = *row_ptr.add(k);
+                s0 += xv * *w0_ptr.add(k);
+                s1 += xv * *w1_ptr.add(k);
+                s2 += xv * *w2_ptr.add(k);
+                s3 += xv * *w3_ptr.add(k);
+                k += 1;
+            }
+
+            *out_ptr.add(j + 0) = s0;
+            *out_ptr.add(j + 1) = s1;
+            *out_ptr.add(j + 2) = s2;
+            *out_ptr.add(j + 3) = s3;
+
+            j += 4;
+        }
+
+        while j < e {
+            let w_ptr = coef_row_major.as_ptr().add(j * c);
+            let mut accv = _mm_setzero_ps();
+            let mut k = 0usize;
+            while k + 16 <= c {
+                let x0 = _mm_loadu_ps(row_ptr.add(k + 0));
+                let w0 = _mm_loadu_ps(w_ptr.add(k + 0));
+                let x1 = _mm_loadu_ps(row_ptr.add(k + 4));
+                let w1 = _mm_loadu_ps(w_ptr.add(k + 4));
+                let x2 = _mm_loadu_ps(row_ptr.add(k + 8));
+                let w2 = _mm_loadu_ps(w_ptr.add(k + 8));
+                let x3 = _mm_loadu_ps(row_ptr.add(k + 12));
+                let w3 = _mm_loadu_ps(w_ptr.add(k + 12));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x0, w0));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x1, w1));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x2, w2));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x3, w3));
+                k += 16;
+            }
+            while k + 4 <= c {
+                let x = _mm_loadu_ps(row_ptr.add(k));
+                let w = _mm_loadu_ps(w_ptr.add(k));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x, w));
+                k += 4;
+            }
+            let mut sum = hsum_sse(accv);
+            while k < c {
+                sum += *row_ptr.add(k) * *w_ptr.add(k);
+                k += 1;
+            }
+            *out_ptr.add(j) = sum;
+            j += 1;
+        }
+    }
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn matmul_rows_avx2_contig(
     input: &[f32],
     n: usize,
@@ -162,6 +367,9 @@ pub unsafe fn matmul_rows_avx2_contig(
 
             let mut k = 0usize;
             while k + 32 <= c {
+                prefetch_read_l1(row_ptr.add(k + 64), 256);
+                prefetch_read_l1(w0_ptr.add(k + 64), 256);
+                
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
                 let x2 = _mm256_loadu_ps(row_ptr.add(k + 16));
@@ -245,6 +453,9 @@ pub unsafe fn matmul_rows_avx2_contig(
             let mut accv = _mm256_setzero_ps();
             let mut k = 0usize;
             while k + 32 <= c {
+                prefetch_read_l1(row_ptr.add(k + 64), 256);
+                prefetch_read_l1(w_ptr.add(k + 64), 256);
+                
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let w0 = _mm256_loadu_ps(w_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
@@ -393,6 +604,79 @@ pub unsafe fn matmul_rows_avx512_contig(
             let mut sum = hsum_avx512(accv);
             while k < c {
                 sum += *row_ptr.add(k) * *w_ptr.add(k);
+                k += 1;
+            }
+            *out_ptr.add(j) = sum;
+            j += 1;
+        }
+    }
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_sse42_contig_t(
+    input: &[f32],
+    n: usize,
+    c: usize,
+    coef_col_major: &[f32],
+    e: usize,
+    out: &mut [f32],
+) {
+    log::debug!("matmul(math): using SSE4.2 contig transposed (n={}, c={}, e={})", n, c, e);
+    debug_assert!(input.len() >= n * c);
+    debug_assert!(coef_col_major.len() >= e * c);
+    debug_assert!(out.len() >= n * e);
+
+    for i in 0..n {
+        let row_ptr = input.as_ptr().add(i * c);
+        let out_ptr = out.as_mut_ptr().add(i * e);
+
+        let mut j = 0usize;
+        while j + 4 <= e {
+            let mut acc = _mm_setzero_ps();
+
+            let mut k = 0usize;
+            while k + 4 <= c {
+                let x = _mm_loadu_ps(row_ptr.add(k));
+
+                let w0 = _mm_loadu_ps(coef_col_major.as_ptr().add((k + 0) * e + j));
+                let w1 = _mm_loadu_ps(coef_col_major.as_ptr().add((k + 1) * e + j));
+                let w2 = _mm_loadu_ps(coef_col_major.as_ptr().add((k + 2) * e + j));
+                let w3 = _mm_loadu_ps(coef_col_major.as_ptr().add((k + 3) * e + j));
+
+                let x0 = _mm_set1_ps(_mm_cvtss_f32(x));
+                let x1 = _mm_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(x, x, 1)));
+                let x2 = _mm_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(x, x, 2)));
+                let x3 = _mm_set1_ps(_mm_cvtss_f32(_mm_shuffle_ps(x, x, 3)));
+                
+                acc = _mm_add_ps(acc, _mm_mul_ps(x0, w0));
+                acc = _mm_add_ps(acc, _mm_mul_ps(x1, w1));
+                acc = _mm_add_ps(acc, _mm_mul_ps(x2, w2));
+                acc = _mm_add_ps(acc, _mm_mul_ps(x3, w3));
+                k += 4;
+            }
+            while k < c {
+                let xv = _mm_set1_ps(*row_ptr.add(k));
+                let wv = _mm_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
+                acc = _mm_add_ps(acc, _mm_mul_ps(xv, wv));
+                k += 1;
+            }
+            _mm_storeu_ps(out_ptr.add(j), acc);
+            j += 4;
+        }
+
+        while j < e {
+            let mut sum = 0f32;
+            let mut k = 0usize;
+            while k + 4 <= c {
+                let x = _mm_loadu_ps(row_ptr.add(k));
+                let w = _mm_loadu_ps(coef_col_major.as_ptr().add(k * e + j));
+                let part = _mm_mul_ps(x, w);
+                sum += hsum_sse(part);
+                k += 4;
+            }
+            while k < c {
+                sum += *row_ptr.add(k) * *coef_col_major.as_ptr().add(k * e + j);
                 k += 1;
             }
             *out_ptr.add(j) = sum;
@@ -558,6 +842,60 @@ pub unsafe fn matmul_rows_avx512_contig_t(
 
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_sse42_gather_t(
+    input_ptr: *const f32,
+    n: usize,
+    c: usize,
+    s0: isize,
+    s1: isize,
+    coef_col_major: &[f32],
+    e: usize,
+    out: &mut [f32],
+    rowbuf: &mut [f32],
+) {
+    log::debug!(
+        "matmul(math): using SSE4.2 gather transposed (n={}, c={}, e={}, s0={}, s1={})",
+        n,
+        c,
+        e,
+        s0,
+        s1
+    );
+    debug_assert!(rowbuf.len() >= c);
+    debug_assert!(coef_col_major.len() >= e * c);
+    debug_assert!(out.len() >= n * e);
+
+    if s1 == 1 && s0 == c as isize {
+        let input_slice = std::slice::from_raw_parts(input_ptr, n * c);
+        return matmul_rows_sse42_contig_t(input_slice, n, c, coef_col_major, e, out);
+    }
+
+    for i in 0..n {
+        let mut k = 0usize;
+        while k + 8 <= c {
+            let base = i as isize * s0 + k as isize * s1;
+            rowbuf[k + 0] = *input_ptr.offset(base + 0 * s1);
+            rowbuf[k + 1] = *input_ptr.offset(base + 1 * s1);
+            rowbuf[k + 2] = *input_ptr.offset(base + 2 * s1);
+            rowbuf[k + 3] = *input_ptr.offset(base + 3 * s1);
+            rowbuf[k + 4] = *input_ptr.offset(base + 4 * s1);
+            rowbuf[k + 5] = *input_ptr.offset(base + 5 * s1);
+            rowbuf[k + 6] = *input_ptr.offset(base + 6 * s1);
+            rowbuf[k + 7] = *input_ptr.offset(base + 7 * s1);
+            k += 8;
+        }
+        while k < c {
+            let off = i as isize * s0 + k as isize * s1;
+            rowbuf[k] = *input_ptr.offset(off);
+            k += 1;
+        }
+
+        matmul_rows_sse42_contig_t(&rowbuf[..c], 1, c, coef_col_major, e, &mut out[i * e..]);
+    }
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn matmul_rows_avx2_gather_t(
     input_ptr: *const f32,
     n: usize,
@@ -607,6 +945,183 @@ pub unsafe fn matmul_rows_avx2_gather_t(
         }
 
         matmul_rows_avx2_contig_t(&rowbuf[..c], 1, c, coef_col_major, e, &mut out[i * e..]);
+    }
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub unsafe fn matmul_rows_sse42_gather(
+    input_ptr: *const f32,
+    n: usize,
+    c: usize,
+    s0: isize,
+    s1: isize,
+    coef_row_major: &[f32],
+    e: usize,
+    out: &mut [f32],
+    rowbuf: &mut [f32],
+) {
+    log::debug!(
+        "matmul(math): using SSE4.2 gather row-major (n={}, c={}, e={}, s0={}, s1={})",
+        n,
+        c,
+        e,
+        s0,
+        s1
+    );
+    debug_assert!(rowbuf.len() >= c);
+    debug_assert!(coef_row_major.len() >= e * c);
+    debug_assert!(out.len() >= n * e);
+
+    if s1 == 1 && s0 == c as isize {
+        let input_slice = std::slice::from_raw_parts(input_ptr, n * c);
+        return matmul_rows_sse42_contig(input_slice, n, c, coef_row_major, e, out);
+    }
+
+    for i in 0..n {
+        let mut k = 0usize;
+        while k + 8 <= c {
+            let base = i as isize * s0 + k as isize * s1;
+            rowbuf[k + 0] = *input_ptr.offset(base + 0 * s1);
+            rowbuf[k + 1] = *input_ptr.offset(base + 1 * s1);
+            rowbuf[k + 2] = *input_ptr.offset(base + 2 * s1);
+            rowbuf[k + 3] = *input_ptr.offset(base + 3 * s1);
+            rowbuf[k + 4] = *input_ptr.offset(base + 4 * s1);
+            rowbuf[k + 5] = *input_ptr.offset(base + 5 * s1);
+            rowbuf[k + 6] = *input_ptr.offset(base + 6 * s1);
+            rowbuf[k + 7] = *input_ptr.offset(base + 7 * s1);
+            k += 8;
+        }
+        while k < c {
+            let off = i as isize * s0 + k as isize * s1;
+            rowbuf[k] = *input_ptr.offset(off);
+            k += 1;
+        }
+
+        let row_ptr = rowbuf.as_ptr();
+        let out_ptr = out.as_mut_ptr().add(i * e);
+
+        let mut j = 0usize;
+        while j + 4 <= e {
+            let w0_ptr = coef_row_major.as_ptr().add((j + 0) * c);
+            let w1_ptr = coef_row_major.as_ptr().add((j + 1) * c);
+            let w2_ptr = coef_row_major.as_ptr().add((j + 2) * c);
+            let w3_ptr = coef_row_major.as_ptr().add((j + 3) * c);
+
+            let mut acc0 = _mm_setzero_ps();
+            let mut acc1 = _mm_setzero_ps();
+            let mut acc2 = _mm_setzero_ps();
+            let mut acc3 = _mm_setzero_ps();
+
+            let mut k = 0usize;
+            while k + 16 <= c {
+                let x0 = _mm_loadu_ps(row_ptr.add(k + 0));
+                let x1 = _mm_loadu_ps(row_ptr.add(k + 4));
+                let x2 = _mm_loadu_ps(row_ptr.add(k + 8));
+                let x3 = _mm_loadu_ps(row_ptr.add(k + 12));
+
+                let w00 = _mm_loadu_ps(w0_ptr.add(k + 0));
+                let w01 = _mm_loadu_ps(w0_ptr.add(k + 4));
+                let w02 = _mm_loadu_ps(w0_ptr.add(k + 8));
+                let w03 = _mm_loadu_ps(w0_ptr.add(k + 12));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x0, w00));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x1, w01));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x2, w02));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x3, w03));
+
+                let w10 = _mm_loadu_ps(w1_ptr.add(k + 0));
+                let w11 = _mm_loadu_ps(w1_ptr.add(k + 4));
+                let w12 = _mm_loadu_ps(w1_ptr.add(k + 8));
+                let w13 = _mm_loadu_ps(w1_ptr.add(k + 12));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x0, w10));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x1, w11));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x2, w12));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x3, w13));
+
+                let w20 = _mm_loadu_ps(w2_ptr.add(k + 0));
+                let w21 = _mm_loadu_ps(w2_ptr.add(k + 4));
+                let w22 = _mm_loadu_ps(w2_ptr.add(k + 8));
+                let w23 = _mm_loadu_ps(w2_ptr.add(k + 12));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x0, w20));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x1, w21));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x2, w22));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x3, w23));
+
+                let w30 = _mm_loadu_ps(w3_ptr.add(k + 0));
+                let w31 = _mm_loadu_ps(w3_ptr.add(k + 4));
+                let w32 = _mm_loadu_ps(w3_ptr.add(k + 8));
+                let w33 = _mm_loadu_ps(w3_ptr.add(k + 12));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x0, w30));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x1, w31));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x2, w32));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x3, w33));
+
+                k += 16;
+            }
+            while k + 4 <= c {
+                let x = _mm_loadu_ps(row_ptr.add(k));
+                let w0 = _mm_loadu_ps(w0_ptr.add(k));
+                let w1 = _mm_loadu_ps(w1_ptr.add(k));
+                let w2 = _mm_loadu_ps(w2_ptr.add(k));
+                let w3 = _mm_loadu_ps(w3_ptr.add(k));
+                acc0 = _mm_add_ps(acc0, _mm_mul_ps(x, w0));
+                acc1 = _mm_add_ps(acc1, _mm_mul_ps(x, w1));
+                acc2 = _mm_add_ps(acc2, _mm_mul_ps(x, w2));
+                acc3 = _mm_add_ps(acc3, _mm_mul_ps(x, w3));
+                k += 4;
+            }
+            let mut s0 = hsum_sse(acc0);
+            let mut s1 = hsum_sse(acc1);
+            let mut s2 = hsum_sse(acc2);
+            let mut s3 = hsum_sse(acc3);
+            while k < c {
+                let xv = *row_ptr.add(k);
+                s0 += xv * *w0_ptr.add(k);
+                s1 += xv * *w1_ptr.add(k);
+                s2 += xv * *w2_ptr.add(k);
+                s3 += xv * *w3_ptr.add(k);
+                k += 1;
+            }
+            *out_ptr.add(j + 0) = s0;
+            *out_ptr.add(j + 1) = s1;
+            *out_ptr.add(j + 2) = s2;
+            *out_ptr.add(j + 3) = s3;
+            j += 4;
+        }
+
+        while j < e {
+            let w_ptr = coef_row_major.as_ptr().add(j * c);
+            let mut accv = _mm_setzero_ps();
+            let mut k = 0usize;
+            while k + 16 <= c {
+                let x0 = _mm_loadu_ps(row_ptr.add(k + 0));
+                let w0 = _mm_loadu_ps(w_ptr.add(k + 0));
+                let x1 = _mm_loadu_ps(row_ptr.add(k + 4));
+                let w1 = _mm_loadu_ps(w_ptr.add(k + 4));
+                let x2 = _mm_loadu_ps(row_ptr.add(k + 8));
+                let w2 = _mm_loadu_ps(w_ptr.add(k + 8));
+                let x3 = _mm_loadu_ps(row_ptr.add(k + 12));
+                let w3 = _mm_loadu_ps(w_ptr.add(k + 12));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x0, w0));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x1, w1));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x2, w2));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x3, w3));
+                k += 16;
+            }
+            while k + 4 <= c {
+                let x = _mm_loadu_ps(row_ptr.add(k));
+                let w = _mm_loadu_ps(w_ptr.add(k));
+                accv = _mm_add_ps(accv, _mm_mul_ps(x, w));
+                k += 4;
+            }
+            let mut sum = hsum_sse(accv);
+            while k < c {
+                sum += *row_ptr.add(k) * *w_ptr.add(k);
+                k += 1;
+            }
+            *out_ptr.add(j) = sum;
+            j += 1;
+        }
     }
 }
 
@@ -677,6 +1192,9 @@ pub unsafe fn matmul_rows_avx2_gather(
 
             let mut k = 0usize;
             while k + 32 <= c {
+                prefetch_read_l1(row_ptr.add(k + 64), 256);
+                prefetch_read_l1(w0_ptr.add(k + 64), 256);
+                
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
                 let x2 = _mm256_loadu_ps(row_ptr.add(k + 16));
@@ -756,6 +1274,9 @@ pub unsafe fn matmul_rows_avx2_gather(
             let mut accv = _mm256_setzero_ps();
             let mut k = 0usize;
             while k + 32 <= c {
+                prefetch_read_l1(row_ptr.add(k + 64), 256);
+                prefetch_read_l1(w_ptr.add(k + 64), 256);
+                
                 let x0 = _mm256_loadu_ps(row_ptr.add(k + 0));
                 let w0 = _mm256_loadu_ps(w_ptr.add(k + 0));
                 let x1 = _mm256_loadu_ps(row_ptr.add(k + 8));
@@ -839,7 +1360,13 @@ pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn dot_neon(x: &[f32], w: &[f32]) -> f32 {
-    if std::is_x86_feature_detected!("avx512f") { dot_avx512(x, w) } else { dot_avx2(x, w) }
+    if std::is_x86_feature_detected!("avx512f") {
+        dot_avx512(x, w)
+    } else if std::is_x86_feature_detected!("avx2") {
+        dot_avx2(x, w)
+    } else {
+        dot_sse42(x, w)
+    }
 }
 
 #[inline(always)]
@@ -1023,8 +1550,10 @@ pub unsafe fn matmul_rows_neon_contig(
 ) {
     if std::is_x86_feature_detected!("avx512f") {
         matmul_rows_avx512_contig(input, n, c, coef_row_major, e, out)
-    } else {
+    } else if std::is_x86_feature_detected!("avx2") {
         matmul_rows_avx2_contig(input, n, c, coef_row_major, e, out)
+    } else {
+        matmul_rows_sse42_contig(input, n, c, coef_row_major, e, out)
     }
 }
 
@@ -1117,8 +1646,10 @@ pub unsafe fn matmul_rows_neon_contig_t(
 ) {
     if std::is_x86_feature_detected!("avx512f") {
         matmul_rows_avx512_contig_t(input, n, c, coef_col_major, e, out)
-    } else {
+    } else if std::is_x86_feature_detected!("avx2") {
         matmul_rows_avx2_contig_t(input, n, c, coef_col_major, e, out)
+    } else {
+        matmul_rows_sse42_contig_t(input, n, c, coef_col_major, e, out)
     }
 }
 
@@ -1185,7 +1716,11 @@ pub unsafe fn matmul_rows_neon_gather_t(
     out: &mut [f32],
     rowbuf: &mut [f32],
 ) {
-    matmul_rows_avx2_gather_t(input_ptr, n, c, s0, s1, coef_col_major, e, out, rowbuf)
+    if std::is_x86_feature_detected!("avx2") {
+        matmul_rows_avx2_gather_t(input_ptr, n, c, s0, s1, coef_col_major, e, out, rowbuf)
+    } else {
+        matmul_rows_sse42_gather_t(input_ptr, n, c, s0, s1, coef_col_major, e, out, rowbuf)
+    }
 }
 
 #[inline(always)]
@@ -1376,5 +1911,9 @@ pub unsafe fn matmul_rows_neon_gather(
     out: &mut [f32],
     rowbuf: &mut [f32],
 ) {
-    matmul_rows_avx2_gather(input_ptr, n, c, s0, s1, coef_row_major, e, out, rowbuf)
+    if std::is_x86_feature_detected!("avx2") {
+        matmul_rows_avx2_gather(input_ptr, n, c, s0, s1, coef_row_major, e, out, rowbuf)
+    } else {
+        matmul_rows_sse42_gather(input_ptr, n, c, s0, s1, coef_row_major, e, out, rowbuf)
+    }
 }

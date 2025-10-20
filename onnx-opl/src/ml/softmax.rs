@@ -312,6 +312,89 @@ mod imp {
 mod imp {
     use std::arch::x86_64::*;
 
+    #[inline(always)]
+    unsafe fn vexp_f32_softmax_fast_sse(x: __m128) -> __m128 {
+        // clamp x >= -30
+        let x = _mm_max_ps(x, _mm_set1_ps(-30.0));
+        // scaled = x * 12102203.2f
+        let scaled = _mm_mul_ps(x, _mm_set1_ps(12102203.2_f32));
+        // bits_i = int(scaled) + (127 << 23)
+        let mut bits_i = _mm_cvtps_epi32(scaled);
+        let offset = _mm_set1_epi32(127 << 23);
+        bits_i = _mm_add_epi32(bits_i, offset);
+        let b = _mm_castsi128_ps(bits_i);
+        // i_bits = bits & 0x7f80_0000; o_bits = bits | 0x3f80_0000
+        let i_bits = _mm_and_si128(bits_i, _mm_set1_epi32(0x7f80_0000u32 as i32));
+        let o_bits = _mm_or_si128(bits_i, _mm_set1_epi32(0x3f80_0000u32 as i32));
+        let i = _mm_castsi128_ps(i_bits);
+        let o = _mm_castsi128_ps(o_bits);
+        let two_i = _mm_add_ps(i, i);
+        let prod = _mm_mul_ps(b, o);
+        _mm_add_ps(prod, two_i)
+    }
+
+    unsafe fn softmax_sse42(row: &mut [f32]) {
+        let len = row.len();
+        let ptr = row.as_mut_ptr();
+
+        // Phase 1: max
+        let mut i = 0usize;
+        let mut vmax = _mm_set1_ps(f32::NEG_INFINITY);
+        while i + 4 <= len {
+            let v = _mm_loadu_ps(ptr.add(i));
+            vmax = _mm_max_ps(vmax, v);
+            i += 4;
+        }
+        // horizontal max to scalar
+        let mut max_scalar = {
+            let mut tmp = [0f32; 4];
+            _mm_storeu_ps(tmp.as_mut_ptr(), vmax);
+            tmp.into_iter().fold(f32::NEG_INFINITY, f32::max)
+        };
+        while i < len {
+            max_scalar = max_scalar.max(*ptr.add(i));
+            i += 1;
+        }
+
+        // Phase 2: exp and sum
+        let mut sum_vec = _mm_setzero_ps();
+        let vbias = _mm_set1_ps(max_scalar);
+        i = 0;
+        while i + 4 <= len {
+            let mut v = _mm_loadu_ps(ptr.add(i));
+            v = _mm_sub_ps(v, vbias);
+            v = vexp_f32_softmax_fast_sse(v);
+            _mm_storeu_ps(ptr.add(i), v);
+            sum_vec = _mm_add_ps(sum_vec, v);
+            i += 4;
+        }
+        let mut sum = {
+            let mut tmp = [0f32; 4];
+            _mm_storeu_ps(tmp.as_mut_ptr(), sum_vec);
+            tmp.into_iter().sum::<f32>()
+        };
+        while i < len {
+            let v = (*ptr.add(i) - max_scalar).exp();
+            *ptr.add(i) = v;
+            sum += v;
+            i += 1;
+        }
+
+        // Phase 3: normalize
+        let inv = 1.0 / sum;
+        let vinv = _mm_set1_ps(inv);
+        i = 0;
+        while i + 4 <= len {
+            let v = _mm_loadu_ps(ptr.add(i));
+            _mm_storeu_ps(ptr.add(i), _mm_mul_ps(v, vinv));
+            i += 4;
+        }
+        while i < len {
+            *ptr.add(i) *= inv;
+            i += 1;
+        }
+    }
+
     #[target_feature(enable = "avx512f,avx512dq,fma")]
     unsafe fn vexp_f32_softmax_fast_avx512(x: __m512) -> __m512 {
         // clamp x >= -30
@@ -409,13 +492,24 @@ mod imp {
             }
             return;
         }
-        log::debug!("softmax: using AVX2 rows path (rows={}, cols={})", rows, cols);
+        if std::is_x86_feature_detected!("avx2") {
+            log::debug!("softmax: using AVX2 rows path (rows={}, cols={})", rows, cols);
+            if cols <= 1 {
+                return;
+            }
+            for r in 0..rows {
+                let row = &mut data[r * cols..(r + 1) * cols];
+                softmax_avx(row);
+            }
+            return;
+        }
+        log::debug!("softmax: using SSE4.2 rows path (rows={}, cols={})", rows, cols);
         if cols <= 1 {
             return;
         }
         for r in 0..rows {
             let row = &mut data[r * cols..(r + 1) * cols];
-            softmax_avx(row);
+            softmax_sse42(row);
         }
     }
 
@@ -428,11 +522,19 @@ mod imp {
             }
             return;
         }
-        log::debug!("softmax: using AVX2 row path (len={})", row.len());
+        if std::is_x86_feature_detected!("avx2") {
+            log::debug!("softmax: using AVX2 row path (len={})", row.len());
+            if row.len() <= 1 {
+                return;
+            }
+            softmax_avx(row);
+            return;
+        }
+        log::debug!("softmax: using SSE4.2 row path (len={})", row.len());
         if row.len() <= 1 {
             return;
         }
-        softmax_avx(row);
+        softmax_sse42(row);
     }
 
     #[target_feature(enable = "avx2,fma")]
@@ -464,8 +566,27 @@ mod imp {
             }
             return;
         }
+        if std::is_x86_feature_detected!("avx2") {
+            log::debug!(
+                "softmax: using AVX2 gather path (rows={}, cols={}, s0={}, s1={})",
+                rows,
+                cols,
+                s0,
+                s1
+            );
+            for r in 0..rows {
+                for c in 0..cols {
+                    let off = r as isize * s0 + c as isize * s1;
+                    rowbuf[c] = *input_ptr.offset(off);
+                }
+                let row = &mut rowbuf[..cols];
+                softmax_inplace_row(row);
+                out[r * cols..(r + 1) * cols].copy_from_slice(row);
+            }
+            return;
+        }
         log::debug!(
-            "softmax: using AVX2 gather path (rows={}, cols={}, s0={}, s1={})",
+            "softmax: using SSE4.2 gather path (rows={}, cols={}, s0={}, s1={})",
             rows,
             cols,
             s0,
@@ -477,7 +598,7 @@ mod imp {
                 rowbuf[c] = *input_ptr.offset(off);
             }
             let row = &mut rowbuf[..cols];
-            softmax_inplace_row(row);
+            softmax_sse42(row);
             out[r * cols..(r + 1) * cols].copy_from_slice(row);
         }
     }
@@ -488,20 +609,44 @@ mod imp {
             return;
         }
         debug_assert_eq!(data.len(), rows * cols);
+        if std::is_x86_feature_detected!("avx2") {
+            for r in 0..rows {
+                let row = &mut data[r * cols..(r + 1) * cols];
+                let ptr = row.as_mut_ptr();
+                let mut i = 0usize;
+                while i + 8 <= cols {
+                    let mut v = _mm256_loadu_ps(ptr.add(i));
+                    v = vexp_f32_softmax_fast_avx(_mm256_sub_ps(_mm256_setzero_ps(), v));
+                    v = _mm256_add_ps(v, _mm256_set1_ps(1.0));
+                    // reciprocal with NR refine: y = y*(2 - d*y)
+                    let mut y = _mm256_rcp_ps(v);
+                    let two = _mm256_set1_ps(2.0);
+                    y = _mm256_mul_ps(y, _mm256_sub_ps(two, _mm256_mul_ps(v, y)));
+                    _mm256_storeu_ps(ptr.add(i), y);
+                    i += 8;
+                }
+                while i < cols {
+                    let z = -*ptr.add(i);
+                    *ptr.add(i) = 1.0 / (1.0 + z.exp());
+                    i += 1;
+                }
+            }
+            return;
+        }
         for r in 0..rows {
             let row = &mut data[r * cols..(r + 1) * cols];
             let ptr = row.as_mut_ptr();
             let mut i = 0usize;
-            while i + 8 <= cols {
-                let mut v = _mm256_loadu_ps(ptr.add(i));
-                v = vexp_f32_softmax_fast_avx(_mm256_sub_ps(_mm256_setzero_ps(), v));
-                v = _mm256_add_ps(v, _mm256_set1_ps(1.0));
+            while i + 4 <= cols {
+                let mut v = _mm_loadu_ps(ptr.add(i));
+                v = vexp_f32_softmax_fast_sse(_mm_sub_ps(_mm_setzero_ps(), v));
+                v = _mm_add_ps(v, _mm_set1_ps(1.0));
                 // reciprocal with NR refine: y = y*(2 - d*y)
-                let mut y = _mm256_rcp_ps(v);
-                let two = _mm256_set1_ps(2.0);
-                y = _mm256_mul_ps(y, _mm256_sub_ps(two, _mm256_mul_ps(v, y)));
-                _mm256_storeu_ps(ptr.add(i), y);
-                i += 8;
+                let mut y = _mm_rcp_ps(v);
+                let two = _mm_set1_ps(2.0);
+                y = _mm_mul_ps(y, _mm_sub_ps(two, _mm_mul_ps(v, y)));
+                _mm_storeu_ps(ptr.add(i), y);
+                i += 4;
             }
             while i < cols {
                 let z = -*ptr.add(i);
