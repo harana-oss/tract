@@ -7,6 +7,7 @@ use std::arch::aarch64::*;
 pub unsafe fn add_bias_avx2_row(row: &mut [f32], bias: &[f32]) {
     use std::arch::x86_64::*;
 
+    log::debug!("bias: using AVX2 row path (len={})", row.len());
     let t = row.len();
     debug_assert_eq!(t, bias.len());
     let mut j = 0usize;
@@ -47,6 +48,7 @@ pub unsafe fn add_bias_avx2_row(row: &mut [f32], bias: &[f32]) {
 pub unsafe fn add_scalar_bias_avx2(out: &mut [f32], bias: f32) {
     use std::arch::x86_64::*;
 
+    log::debug!("bias: using AVX2 scalar path (len={})", out.len());
     let len = out.len();
     let bias_vec = _mm256_set1_ps(bias);
     let mut i = 0usize;
@@ -77,6 +79,7 @@ pub unsafe fn add_scalar_bias_avx2(out: &mut [f32], bias: f32) {
 
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn add_bias_avx2_rows(out: &mut [f32], bias: &[f32], n: usize, t: usize) {
+    log::debug!("bias: using AVX2 rows path (n={}, t={})", n, t);
     debug_assert_eq!(out.len(), n * t);
     debug_assert_eq!(bias.len(), t);
     for i in 0..n {

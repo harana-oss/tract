@@ -18,11 +18,9 @@ mod thread_setup;
 static GLOBAL: snmalloc_rs::SnMalloc = snmalloc_rs::SnMalloc;
 
 fn bench_linear_classifier(c: &mut Criterion) {
-    let _ = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or("info"),
-    )
-    .format_timestamp_millis()
-    .try_init();
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .format_timestamp_millis()
+        .try_init();
 
     let mut group = c.benchmark_group("onnx_linear_classifier");
     group.sample_size(10);
@@ -40,7 +38,10 @@ fn bench_linear_classifier(c: &mut Criterion) {
         log::info!("thread_setup: enabled (THREAD_SETUP={:?})", std::env::var("THREAD_SETUP").ok());
         thread_setup::init();
     } else {
-        log::info!("thread_setup: disabled by THREAD_SETUP={:?}", std::env::var("THREAD_SETUP").ok());
+        log::info!(
+            "thread_setup: disabled by THREAD_SETUP={:?}",
+            std::env::var("THREAD_SETUP").ok()
+        );
     }
 
     let model_path = std::env::var("MODEL_PATH")

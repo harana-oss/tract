@@ -346,6 +346,7 @@ unsafe fn argmax_row_impl_avx2(row: &[f32]) -> usize {
 pub fn argmax_row(row: &[f32]) -> usize {
     // Prefer AVX2 when available; fall back to scalar otherwise.
     if std::is_x86_feature_detected!("avx2") {
+        log::debug!("argmax: using AVX2 path");
         // SAFETY: We checked AVX2 is available at runtime.
         unsafe { argmax_row_impl_avx2(row) }
     } else {

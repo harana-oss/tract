@@ -306,6 +306,7 @@ mod imp {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace_rows(data: &mut [f32], rows: usize, cols: usize) {
+        log::debug!("softmax: using AVX2 rows path (rows={}, cols={})", rows, cols);
         if cols <= 1 { return; }
         for r in 0..rows {
             let row = &mut data[r * cols..(r + 1) * cols];
@@ -315,6 +316,7 @@ mod imp {
 
     #[target_feature(enable = "avx2,fma")]
     pub unsafe fn softmax_inplace_row(row: &mut [f32]) {
+        log::debug!("softmax: using AVX2 row path (len={})", row.len());
         if row.len() <= 1 { return; }
         softmax_avx(row);
     }
@@ -329,6 +331,10 @@ mod imp {
         out: &mut [f32],
         rowbuf: &mut [f32],
     ) {
+        log::debug!(
+            "softmax: using AVX2 gather path (rows={}, cols={}, s0={}, s1={})",
+            rows, cols, s0, s1
+        );
         for r in 0..rows {
             for c in 0..cols {
                 let off = r as isize * s0 + c as isize * s1;

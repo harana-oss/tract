@@ -540,6 +540,10 @@ mod imp {
 
     #[target_feature(enable = "avx2,fma")]
         pub unsafe fn gemm_rows_contig(&self, input: &[f32], n: usize, out: &mut [f32]) {
+            log::debug!(
+                "matmul: using AVX2 gemm_rows_contig (n={}, c={}, e={})",
+                n, self.c, self.e
+            );
             debug_assert!(input.len() >= n * self.c);
             debug_assert!(out.len() >= n * self.e);
 
@@ -844,6 +848,10 @@ mod imp {
             out: &mut [f32],
             rowbuf: &mut [f32],
         ) {
+            log::debug!(
+                "matmul: using AVX2 gemm_rows_gather (n={}, c={}, e={}, s0={}, s1={})",
+                n, self.c, self.e, s0, s1
+            );
             debug_assert!(rowbuf.len() >= self.c * 2);
 
             let c = self.c;

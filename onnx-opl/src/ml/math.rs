@@ -22,6 +22,7 @@ unsafe fn hsum_avx(__m256: __m256) -> f32 {
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub unsafe fn dot_avx2(x: &[f32], w: &[f32]) -> f32 {
+    log::debug!("math: using AVX2 dot (len={})", x.len());
     debug_assert_eq!(x.len(), w.len());
     let len = x.len();
     let mut i = 0usize;
@@ -82,6 +83,7 @@ pub unsafe fn matmul_rows_avx2_contig(
     e: usize,
     out: &mut [f32],
 ) {
+    log::debug!("matmul(math): using AVX2 contig row-major (n={}, c={}, e={})", n, c, e);
     debug_assert!(input.len() >= n * c);
     debug_assert!(coef_row_major.len() >= e * c);
     debug_assert!(out.len() >= n * e);
@@ -228,6 +230,7 @@ pub unsafe fn matmul_rows_avx2_contig_t(
     e: usize,
     out: &mut [f32],
 ) {
+    log::debug!("matmul(math): using AVX2 contig transposed (n={}, c={}, e={})", n, c, e);
     debug_assert!(input.len() >= n * c);
     debug_assert!(coef_col_major.len() >= e * c);
     debug_assert!(out.len() >= n * e);
@@ -303,6 +306,10 @@ pub unsafe fn matmul_rows_avx2_gather_t(
     out: &mut [f32],
     rowbuf: &mut [f32],
 ) {
+    log::debug!(
+        "matmul(math): using AVX2 gather transposed (n={}, c={}, e={}, s0={}, s1={})",
+        n, c, e, s0, s1
+    );
     debug_assert!(rowbuf.len() >= c);
     debug_assert!(coef_col_major.len() >= e * c);
     debug_assert!(out.len() >= n * e);
@@ -349,6 +356,10 @@ pub unsafe fn matmul_rows_avx2_gather(
     out: &mut [f32],
     rowbuf: &mut [f32],
 ) {
+    log::debug!(
+        "matmul(math): using AVX2 gather row-major (n={}, c={}, e={}, s0={}, s1={})",
+        n, c, e, s0, s1
+    );
     debug_assert!(rowbuf.len() >= c);
     debug_assert!(coef_row_major.len() >= e * c);
     debug_assert!(out.len() >= n * e);
