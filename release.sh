@@ -31,15 +31,16 @@ fi
 
 crate=$(tomato get package.name $CRATE_PATH/Cargo.toml)
 tomato set package.version $VERSION $CRATE_PATH/Cargo.toml
-./.change_crate_dep.sh $crate $VERSION
-
-if [ "$crate" = "tract-metal" -o "$crate" = 'tract-cuda' ]
+if [ "$crate" = "tract-metal" ]
 then
     cargo publish -q --allow-dirty --no-verify -p $crate 
 else
     cargo publish -q --allow-dirty -p $crate
 fi
 
+#./.change_crate_dep.sh $crate $VERSION
+#
+#cargo update
 
 if [ "$CRATE_PATH" = "cli" ]
 then

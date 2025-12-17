@@ -1,12 +1,5 @@
 # Unreleased
 
-# 0.22.0 - 2025-08-25
-* [Breaking][MSRV] MSRV bumped to 1.85.0
-* port to edition 2024
-* bump virtuaally each and every dependency
-* (wip, experimental) cuda support for llm
-
-
 # 0.21.12 - 2025-04-10
 
 * multithread matmul is feature gated now ("multithread-mm" on linal)
@@ -544,4 +537,12 @@ I wish I had seen these issues yesterday. Anyway, version numbers are cheap.
 ## Before...
 
 This Changelog started way too late. But better late than never.
+=======
+# Changelog
 
+All notable changes to this project will be documented in this file.
+
+---
+## 2022-07-27
+
+### Changed

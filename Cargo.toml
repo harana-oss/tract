@@ -138,24 +138,22 @@ clap = { version = "~3.1", features = [ "cargo" ] }
 colorous = "1.0.5"
 core_affinity = "0.8.0"
 criterion = "0.6"
-cudarc = { version = "0.17", features = ["dynamic-loading", "cuda-12060", "f16", "cudnn"] }
+cudarc = { version = "0.16.4", features = ["dynamic-loading", "cuda-12060", "f16"] }
 derive-new = "0.5.9"
 dinghy-test = "0.6"
-dirs = "6.0.0"
 downcast-rs = "1.2.0"
 dyn-clone = "1.0.4"
 dyn-hash = "0.2"
 env_logger = "0.10"
 flatbuffers = "23.1.21"
 flate2 = "1.0.20"
-float-ord = "0.3.2"
 foreign-types = "0.5"
 fs-err = "2"
 fs2 = "0.4.3"
 gdt-cpus = "25.5.0"
 getrandom = "0.2"
-half = { version=">=2.4,<3.0", features = [ "std", "num-traits" ] }
-home = "=0.5.11"
+half = { version="2.4.1", features = [ "std", "num-traits" ] }
+home = "0.5.9"
 icu_collections = "1.5.1"
 icu_normalizer = "1.5.0"
 icu_normalizer_data = "1.5.1"
@@ -165,7 +163,6 @@ idna_adapter = "1.2.0"
 image = "0.24.1"
 itertools = "0.12.1"
 lazy_static = "1.5.0"
-levenshtein-diff = "0.2.4"
 libc = "0.2.177"
 libm = "0.2.11"
 liquid = "0.26.8"
@@ -200,7 +197,7 @@ rand = { version = "0.8.4", features = ["small_rng"] }
 rand_xoshiro = "0.6"
 rand_distr = "0.4"
 rayon = "1.10"
-readings-probe = "0.1.8"
+readings-probe = "0.1.7"
 regex = "1.5.4"
 reqwest = { version = "0.12", features = [ "blocking", "rustls-tls" ], default-features = false }
 rustfft = { version = "6.1", features = [ "neon" ] }
@@ -210,7 +207,6 @@ safetensors = "0.6"
 scan_fmt = "0.2.6"
 serde = { version = "1.0.127", features = [ "derive" ] }
 serde_json = "1.0"
-simd-adler32 = { version = "0.3.7", features = ["std"] }
 simsimd = "6"
 smallvec = "1.6.1"
 snmalloc-rs = "0.3"
@@ -230,30 +226,30 @@ walkdir = "2.3.2"
 writeable = "0.6.0"
 zerofrom = "0.1.5"
 zerotrie = "0.2.1"
-tract-api = { version = "0.22.1-pre", path = 'api' }
-tract-core = { version = "0.22.1-pre", path = 'core' }
-tract-cuda = { version = "0.22.1-pre", path = 'cuda' }
-tract-data = { version = "0.22.1-pre", path = 'data' }
-tract-extra = { version = "0.22.1-pre", path = 'extra' }
-tract-gpu = { version = "0.22.1-pre", path = 'gpu' }
-tract-hir = { version = "0.22.1-pre", path = 'hir' }
-tract-libcli = { version = "0.22.1-pre", path = 'libcli' }
-tract-linalg = { version = "0.22.1-pre", path = 'linalg' }
-tract-metal = { version = "0.22.1-pre", path = 'metal' }
-tract-nnef-resources = { version = "0.22.1-pre", path = 'nnef/nnef-resources' }
-tract-nnef = { version = "0.22.1-pre", path = 'nnef' }
-tract-onnx-opl = { version = "0.22.1-pre", path = 'onnx-opl' }
-tract-onnx = { version = "0.22.1-pre", path = 'onnx' }
-tract-pulse-opl = { version = "0.22.1-pre", path = 'pulse-opl' }
-tract-pulse = { version = "0.22.1-pre", path = 'pulse' }
-tract-tensorflow = { version = "0.22.1-pre", path = 'tensorflow' }
-tract-tflite = { version = "0.22.1-pre", path = 'tflite' }
-tract-transformers = { version = "0.22.1-pre", path = 'transformers' }
-tract-rs = { version = "0.22.1-pre", path = 'api/rs' }
-tract-proxy = { version = "0.22.1-pre", path = 'api/proxy' }
-tract-proxy-sys = { version = "0.22.1-pre", path = 'api/proxy/sys' }
-tract-ffi = { version = "0.22.1-pre" }
-tract = { version = "0.22.1-pre" }
+tract-api = { version = "0.21.14-pre", path = 'api' }
+tract-core = { version = "0.21.14-pre", path = 'core' }
+tract-cuda = { version = "0.21.14-pre", path = 'cuda' }
+tract-data = { version = "0.21.14-pre", path = 'data' }
+tract-extra = { version = "0.21.14-pre", path = 'extra' }
+tract-gpu = { version = "0.21.14-pre", path = 'gpu' }
+tract-hir = { version = "0.21.14-pre", path = 'hir' }
+tract-libcli = { version = "0.21.14-pre", path = 'libcli' }
+tract-linalg = { version = "0.21.14-pre", path = 'linalg' }
+tract-metal = { version = "0.21.14-pre", path = 'metal' }
+tract-nnef-resources = { version = "0.21.14-pre", path = 'nnef/nnef-resources' }
+tract-nnef = { version = "0.21.14-pre", path = 'nnef' }
+tract-onnx-opl = { version = "0.21.14-pre", path = 'onnx-opl' }
+tract-onnx = { version = "0.21.14-pre", path = 'onnx' }
+tract-pulse-opl = { version = "0.21.14-pre", path = 'pulse-opl' }
+tract-pulse = { version = "0.21.14-pre", path = 'pulse' }
+tract-tensorflow = { version = "0.21.14-pre", path = 'tensorflow' }
+tract-tflite = { version = "0.21.14-pre", path = 'tflite' }
+tract-transformers = { version = "0.21.14-pre", path = 'transformers' }
+tract-rs = { version = "0.21.14-pre", path = 'api/rs' }
+tract-proxy = { version = "0.21.14-pre", path = 'api/proxy' }
+tract-proxy-sys = { version = "0.21.14-pre", path = 'api/proxy/sys' }
+tract-ffi = { version = "0.21.14-pre" }
+tract = { version = "0.21.14-pre" }
 
 [profile.dev]
 debug = 2
