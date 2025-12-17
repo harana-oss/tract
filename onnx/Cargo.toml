@@ -1,0 +1,67 @@
+[package]
+name = "tract-onnx"
+version = "0.21.14-pre"
+authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
+license = "MIT OR Apache-2.0"
+description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
+repository = "https://github.com/snipsco/tract"
+keywords = [ "TensorFlow", "NeuralNetworks", "ONNX" ]
+categories = [ "science" ]
+autobenches = false
+edition = "2024"
+exclude = [ "test_cases" ]
+# build = "build-proto-rs"
+rust-version = "1.85"
+
+
+[badges]
+maintenance = { status = "actively-developed" }
+
+[dependencies]
+bytes.workspace = true
+derive-new.workspace = true
+gdt-cpus.workspace = true
+log.workspace = true
+memmap2.workspace = true
+num-integer.workspace = true
+orx-parallel.workspace = true
+par-core.workspace = true
+par-iter.workspace = true
+prost.workspace = true
+rand.workspace = true
+rand_xoshiro.workspace = true
+rayon.workspace = true
+smallvec.workspace = true
+snmalloc-rs.workspace = true
+tract-nnef.workspace = true
+tract-hir.workspace = true
+tract-onnx-opl.workspace = true
+
+[dev-dependencies]
+env_logger.workspace = true
+criterion.workspace = true
+ureq = { version = "2", default-features = true }
+libc = "0.2"
+num_cpus = "1"
+
+[[bench]]
+name = "linear_classifier"
+harness = false
+
+# [build-dependencies]
+# protobuf-src = "1.0.5+3.19.3"
+# prost-build = "0.11.1"
+
+[features]
+default = []
+getrandom-js = ["tract-onnx-opl/getrandom-js"]
+
+[profile.dev]
+debug = 2
+strip = "false"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
