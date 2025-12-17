@@ -29,6 +29,8 @@ use lazy_static::lazy_static;
 use mmm::{MMMInputFormat, MatMatMul, PanelExtractor};
 use tract_data::internal::TensorView;
 #[cfg(target_arch = "x86_64")]
+pub mod x86_64_avx512;
+#[cfg(target_arch = "x86_64")]
 pub mod x86_64_fma;
 
 pub mod hwbench;

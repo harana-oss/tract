@@ -4,7 +4,7 @@ use crate::ops::binary::TypedBinOp;
 use crate::ops::cast::cast;
 use crate::ops::change_axes::wire_with_rank_broadcast;
 use crate::ops::element_wise::ElementWiseOp;
-use crate::ops::math::{div, square, Mul, Square};
+use crate::ops::math::{Mul, Square, div, square};
 use std::convert::TryFrom;
 use std::iter::Sum;
 use std::mem::transmute;
@@ -257,20 +257,96 @@ fn argmax_t<T>(v: ArrayViewD<T>, last: bool) -> i64
 where
     T: Copy + Datum + num_traits::Bounded + ::std::cmp::PartialOrd,
 {
+    if T::datum_type() == f32::datum_type() {
+        if let Some(slice) = v.as_slice() {
+            // Fast path: use linalg max reducer to get the max value, then find index.
+            let slice_f32: &[f32] = unsafe { std::mem::transmute(slice) };
+            let max_val = (tract_linalg::ops().max_f32)().run(slice_f32).unwrap();
+            // Try AVX-512 accelerated index search on x86_64 if available.
+            #[cfg(target_arch = "x86_64")]
+            if std::is_x86_feature_detected!("avx512f") {
+                if let Some(ix) = unsafe { argmax_index_f32_avx512(slice_f32, max_val, last) } {
+                    return ix as i64;
+                }
+            }
+            if last {
+                for (i, &x) in slice_f32.iter().enumerate().rev() {
+                    if x == max_val {
+                        return i as i64;
+                    }
+                }
+            } else {
+                for (i, &x) in slice_f32.iter().enumerate() {
+                    if x == max_val {
+                        return i as i64;
+                    }
+                }
+            }
+            return 0;
+        }
+    }
     v.iter()
         .copied()
         .enumerate()
         .fold(
             (0usize, T::min_value()),
             |acc, v| {
-                if v.1 > acc.1 || (last && acc.1 == v.1) {
-                    v
-                } else {
-                    acc
-                }
+                if v.1 > acc.1 || (last && acc.1 == v.1) { v } else { acc }
             },
         )
         .0 as i64
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn argmax_index_f32_avx512(slice: &[f32], target: f32, last: bool) -> Option<usize> {
+    use std::arch::x86_64::*;
+    if slice.is_empty() {
+        return None;
+    }
+    let lanes = 16usize;
+    let zt = _mm512_set1_ps(target);
+    if last {
+        // scan from end in chunks of 16
+        let mut i = slice.len();
+        while i >= lanes {
+            let base = i - lanes;
+            let p = slice.as_ptr().add(base) as *const __m512;
+            let v = _mm512_loadu_ps(p);
+            let mask = _mm512_cmp_ps_mask(v, zt, _MM_CMPINT_OEQ);
+            if mask != 0 {
+                // highest set bit in mask
+                let idx = 15 - mask.leading_zeros() as usize;
+                return Some(base + idx);
+            }
+            i -= lanes;
+        }
+        // tail
+        for j in (0..i).rev() {
+            if slice[j] == target {
+                return Some(j);
+            }
+        }
+        None
+    } else {
+        let mut i = 0usize;
+        while i + lanes <= slice.len() {
+            let p = slice.as_ptr().add(i) as *const __m512;
+            let v = _mm512_loadu_ps(p);
+            let mask = _mm512_cmp_ps_mask(v, zt, _MM_CMPINT_OEQ);
+            if mask != 0 {
+                let idx = mask.trailing_zeros() as usize; // first set bit
+                return Some(i + idx);
+            }
+            i += lanes;
+        }
+        for j in i..slice.len() {
+            if slice[j] == target {
+                return Some(j);
+            }
+        }
+        None
+    }
 }
 
 fn argmin_t<T>(v: ArrayViewD<T>, last: bool) -> i64
@@ -283,11 +359,7 @@ where
         .fold(
             (0usize, T::max_value()),
             |acc, v| {
-                if v.1 < acc.1 || (last && acc.1 == v.1) {
-                    v
-                } else {
-                    acc
-                }
+                if v.1 < acc.1 || (last && acc.1 == v.1) { v } else { acc }
             },
         )
         .0 as i64
@@ -417,9 +489,11 @@ impl TypedOp for Reduce {
                             .output(0, ix),
                     )
                 } else {
-                    tvec!(Axis::new(letters.next().unwrap(), inputs.len(), outputs.len())
-                        .input(0, ix)
-                        .output(0, ix))
+                    tvec!(
+                        Axis::new(letters.next().unwrap(), inputs.len(), outputs.len())
+                            .input(0, ix)
+                            .output(0, ix)
+                    )
                 }
                 .into_iter()
             })

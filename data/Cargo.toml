@@ -1,6 +1,6 @@
 [package]
 name = "tract-data"
-version = "0.21.14-pre"
+version = "0.22.1-pre"
 license = "MIT OR Apache-2.0"
 authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
 description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
@@ -22,7 +22,6 @@ dyn-hash.workspace = true
 half.workspace = true
 itertools.workspace = true
 libm.workspace = true
-log.workspace = true
 maplit.workspace = true
 ndarray.workspace = true
 nom.workspace = true
@@ -35,7 +34,6 @@ lazy_static.workspace = true
 scan_fmt.workspace = true
 string-interner.workspace = true
 parking_lot = "0.12.3"
-dashmap = "6"
 
 [target.'cfg(not(target_family = "wasm"))'.dev-dependencies]
 criterion.workspace = true

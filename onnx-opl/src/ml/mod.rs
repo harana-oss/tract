@@ -1,17 +1,9 @@
-#![feature(target_feature_inline_always)]
-
 use tract_nnef::internal::*;
 
-pub mod argmax;
-pub mod bias;
 pub mod category_mapper;
 pub mod linear_classifier;
 pub mod linear_regressor;
-pub mod math;
-pub mod matmul;
 pub mod normalizer;
-pub mod smallvec;
-pub mod softmax;
 pub mod tree;
 pub mod tree_ensemble_classifier;
 

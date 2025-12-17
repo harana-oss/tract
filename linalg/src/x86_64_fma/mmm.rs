@@ -7,6 +7,16 @@ use tract_data::internal::*;
 
 use super::*;
 
+// Declare which fused specs this backend supports in epilogue.
+// AVX-512 float kernels implement scalar/bin per-row/per-col ops, AddUnicast, AddRowColProducts,
+// leaky-relu, and store. They do not implement integer quantization steps (q_scale/shifts).
+const CAN_FUSE: fn(&FusedSpec) -> bool = |f| {
+    !matches!(
+        f,
+        &FusedSpec::QScale(..) | &FusedSpec::RoundingShiftRight(..) | &FusedSpec::ShiftLeft(..)
+    )
+};
+
 MMMExternKernel!(fma_mmm_f32_8x8 <f32>(8, 8)@(256,4) where(FMA) quality(ManuallyOptimized));
 MMMExternKernel!(fma_mmm_f32_16x6<f32>(16,6)@(256,4) where(FMA) quality(ManuallyOptimized));
 MMMExternKernel!(fma_mmm_f32_16x5<f32>(16,5)@(256,4) where(FMA) quality(ManuallyOptimized));
@@ -33,15 +43,15 @@ MMMExternKernel!(fma_mmm_f32_32x3<f32>(32,3)@(256,4) where(FMA)
  store(f16)
 );
 
-MMMExternKernel!(avx512_mmm_f32_128x1<f32>(128, 1)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_64x3 <f32>( 64, 3)@(512,4) where (AVX512F) quality(ManuallyOptimized));
-MMMExternKernel!(avx512_mmm_f32_80x2 <f32>( 80, 2)@(512,4) where (AVX512F) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_128x1<f32>(128, 1)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_16x1 <f32>( 16, 1)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_16x12<f32>( 16,12)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_16x8 <f32>( 16, 8)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_32x6 <f32>( 32, 6)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_32x5 <f32>( 32, 5)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_48x4 <f32>( 48, 4)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_64x3 <f32>( 64, 3)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
+MMMExternKernel!(avx512_mmm_f32_80x2 <f32>( 80, 2)@(512,4) where (AVX512F) can_fuse(CAN_FUSE) quality(ManuallyOptimized));
 
 MMMExternKernel!(amx_mmm_bf16_16x16<f32>(16, 16)@(1024,2) where(has_amx_bf16) quality(ManuallyOptimized) store(f16));
 MMMExternKernel!(amx_mmm_bf16_32x32<f32>(32, 32)@(1024,2) where(has_amx_bf16) quality(ManuallyOptimized) store(f16));

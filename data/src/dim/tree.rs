@@ -1,7 +1,7 @@
 use crate::dim::Assertion;
 use crate::internal::*;
 
-use super::{DimLike, sym::*};
+use super::{sym::*, DimLike};
 use itertools::Itertools;
 use num_integer::Integer;
 use num_traits::{AsPrimitive, PrimInt, Zero};
@@ -112,76 +112,38 @@ impl TDim {
 
     #[inline]
     pub fn as_i64(&self) -> Option<i64> {
-        if let Val(v) = self { Some(*v) } else { None }
+        if let Val(v) = self {
+            Some(*v)
+        } else {
+            None
+        }
     }
 
-    #[inline]
     pub fn eval_to_i64(&self, values: &SymbolValues) -> TractResult<i64> {
         match self {
             Sym(sym) => {
-                if let Some(v) = values.get(sym) {
-                    Ok(v)
-                } else {
+                let Some(v) = values.get(sym) else {
                     bail!(TooEarly::UndeterminedSymbol(self.clone()))
-                }
+                };
+                Ok(v)
             }
             Val(v) => Ok(*v),
             Add(terms) => {
-                let mut acc: i64 = 0;
-                for t in terms {
-                    acc += t.eval_to_i64(values)?;
-                }
-                Ok(acc)
+                terms.iter().try_fold(0, |acc, it| it.eval_to_i64(values).map(|x| acc + x))
             }
             Mul(terms) => {
-                let mut acc: i64 = 1;
-                for t in terms {
-                    let v = t.eval_to_i64(values)?;
-                    if v == 0 {
-                        return Ok(0);
-                    }
-                    acc *= v;
-                }
-                Ok(acc)
+                terms.iter().try_fold(1, |acc, it| it.eval_to_i64(values).map(|x| acc * x))
             }
-            Min(terms) => {
-                let mut acc: i64 = i64::MAX;
-                for t in terms {
-                    let v = t.eval_to_i64(values)?;
-                    if v < acc {
-                        acc = v;
-                    }
-                }
-                Ok(acc)
-            }
-            Max(terms) => {
-                let mut acc: i64 = i64::MIN;
-                for t in terms {
-                    let v = t.eval_to_i64(values)?;
-                    if v > acc {
-                        acc = v;
-                    }
-                }
-                Ok(acc)
-            }
-            Broadcast(terms) => {
-                // Fast path common broadcast cases to avoid calling broadcast() unnecessarily.
-                let mut acc: usize = 1;
-                for t in terms {
-                    let x = t.eval_to_i64(values)? as usize;
-                    if x == acc || x == 1 {
-                        // no-op
-                        continue;
-                    }
-                    if acc == 1 {
-                        acc = x;
-                        continue;
-                    }
-                    // Defer to broadcast check for general case
-                    acc = acc.broadcast(x)?;
-                }
-                Ok(acc as i64)
-            }
+            Min(terms) => terms
+                .iter()
+                .try_fold(i64::MAX, |acc, it| it.eval_to_i64(values).map(|x| acc.min(x))),
+            Max(terms) => terms
+                .iter()
+                .try_fold(i64::MIN, |acc, it| it.eval_to_i64(values).map(|x| acc.max(x))),
+            Broadcast(terms) => terms.iter().try_fold(1i64, |acc, it| {
+                it.eval_to_i64(values)
+                    .and_then(|x| ((acc as usize).broadcast(x as usize)).map(|x| x as i64))
+            }),
             Div(a, q) => Ok(a.eval_to_i64(values)? / *q as i64),
             MulInt(p, a) => Ok(a.eval_to_i64(values)? * *p),
         }
@@ -212,8 +174,9 @@ impl TDim {
             return Val(*v);
         }
         let scope = self.find_scope().unwrap();
-        let scope = scope.0.clone();
-        let scope = scope.read();
+        let scope = scope.0;
+        let locked = scope.lock();
+        let scope = locked.borrow();
         self.clone().simplify_rec(&scope, Some(scenario))
     }
 
@@ -352,8 +315,9 @@ impl TDim {
         let Some(scope) = self.find_scope() else {
             return self;
         };
-        let scope = scope.0.clone();
-        let scope = scope.read();
+        let scope = scope.0;
+        let locked = scope.lock();
+        let scope = locked.borrow();
         let it = self.simplify_rec(&scope, None);
         let mut current: Option<TDim> = None;
         for scenario in scope.scenarios() {
@@ -444,7 +408,7 @@ impl TDim {
             MulInt(coef, expr) => {
                 match *expr {
                     MulInt(c2, inner) => {
-                        return MulInt(coef * c2, inner).simplify_rec(scope, scenario);
+                        return MulInt(coef * c2, inner).simplify_rec(scope, scenario)
                     }
                     Val(v) => return Val(coef * v),
                     _ => {}
@@ -475,10 +439,13 @@ impl TDim {
                 } else if let MulInt(-1, a) = a {
                     MulInt(-1, b!(Div(a, q)))
                 } else if let Add(mut terms) = a {
-                    if terms
-                        .iter()
-                        .any(|t| if let MulInt(-1, s) = t { matches!(&**s, Sym(_)) } else { false })
-                    {
+                    if terms.iter().any(|t| {
+                        if let MulInt(-1, s) = t {
+                            matches!(&**s, Sym(_))
+                        } else {
+                            false
+                        }
+                    }) {
                         MulInt(
                             -1,
                             b!(Div(
@@ -705,7 +672,8 @@ impl TDim {
             return Some(*v);
         }
         let scope = self.find_scope()?;
-        let data = scope.0.read();
+        let data = scope.0.lock();
+        let data = data.borrow();
         self.inclusive_bound(&data, false)
     }
 
@@ -714,7 +682,8 @@ impl TDim {
             return Some(*v);
         }
         let scope = self.find_scope()?;
-        let data = scope.0.read();
+        let data = scope.0.lock();
+        let data = data.borrow();
         self.inclusive_bound(&data, true)
     }
 
@@ -723,7 +692,8 @@ impl TDim {
             return *v >= 0;
         }
         let Some(scope) = self.find_scope() else { return false };
-        let data = scope.0.read();
+        let data = scope.0.lock();
+        let data = data.borrow();
         data.prove_positive_or_zero(self)
     }
 
@@ -833,28 +803,6 @@ impl TDim {
 
     #[allow(clippy::mutable_key_type)]
     pub fn symbols(&self) -> std::collections::HashSet<Symbol> {
-        if let Some(scope) = self.find_scope() {
-            let lock = scope.0.read();
-            if let Some(cached) = lock.symbols_cache_get(self) {
-                return cached;
-            }
-            drop(lock);
-            let computed = match self {
-                Val(_) => maplit::hashset!(),
-                Sym(s) => maplit::hashset!(s.clone()),
-                Add(terms) | Mul(terms) | Broadcast(terms) | Min(terms) | Max(terms) => {
-                    terms.iter().fold(maplit::hashset!(), |mut set, v| {
-                        set.extend(v.symbols());
-                        set
-                    })
-                }
-                MulInt(_, a) => a.symbols(),
-                Div(a, _) => a.symbols(),
-            };
-            let lock = scope.0.read();
-            lock.symbols_cache_put(self.clone(), computed.clone());
-            return computed;
-        }
         match self {
             Val(_) => maplit::hashset!(),
             Sym(s) => maplit::hashset!(s.clone()),
@@ -883,7 +831,11 @@ pub(super) fn reduce_ratio(mut p: i64, mut q: i64) -> (i64, u64) {
         p /= gcd;
         q /= gcd;
     }
-    if q < 0 { (-p, (-q) as u64) } else { (p, q as u64) }
+    if q < 0 {
+        (-p, (-q) as u64)
+    } else {
+        (p, q as u64)
+    }
 }
 
 impl Zero for TDim {
@@ -977,7 +929,11 @@ impl<'a> From<&'a Symbol> for TDim {
 impl ops::Neg for TDim {
     type Output = Self;
     fn neg(self) -> Self {
-        if let Val(v) = self { Val(-v) } else { TDim::MulInt(-1, Box::new(self)).reduce() }
+        if let Val(v) = self {
+            Val(-v)
+        } else {
+            TDim::MulInt(-1, Box::new(self)).reduce()
+        }
     }
 }
 

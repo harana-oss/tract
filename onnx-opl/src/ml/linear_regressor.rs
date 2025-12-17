@@ -1,11 +1,3 @@
-#![allow(unsafe_op_in_unsafe_fn)]
-
-use super::smallvec::SmallVec;
-use crate::ml::bias;
-use crate::ml::matmul::MatmulTiled;
-use crate::ml::{math, softmax};
-#[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
 use std::hash::{Hash, Hasher};
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
@@ -34,10 +26,6 @@ pub struct LinearRegressorData {
     pub feat_c: usize,
     pub coefficients_raw: Arc<[f32]>, // row-major (targets, feat_c)
     pub coefficients_t: Arc<[f32]>,   // transposed (feat_c, targets)
-    pub prefer_transposed: bool,
-    pub packed_tiled: Option<MatmulTiled>,
-    pub bias_scalar: f32,
-    pub intercepts_vec: Option<Arc<[f32]>>, // length == targets
 }
 
 impl Hash for LinearRegressorData {
@@ -85,28 +73,6 @@ impl LinearRegressorData {
         }
         let coefficients_raw: Arc<[f32]> = coeff_slice.to_vec().into();
         let coefficients_t: Arc<[f32]> = transposed.into();
-
-        // Heuristics consistent with LinearClassifier
-        let prefer_transposed = t >= 4 && feat_c >= 16;
-        let packed_tiled = if t >= 8 && feat_c >= 16 {
-            Some(MatmulTiled::new_from_transposed(&coefficients_t, feat_c, t))
-        } else {
-            None
-        };
-
-        // Precompute bias representation
-        let mut bias_scalar = 0.0f32;
-        let mut intercepts_vec: Option<Arc<[f32]>> = None;
-        if let Some(b) = &intercepts {
-            let bsl = b.as_slice::<f32>()?;
-            if bsl.len() == 1 {
-                bias_scalar = bsl[0];
-            } else if bsl.len() == t {
-                intercepts_vec = Some(bsl.to_vec().into());
-            } else {
-                bail!("Unsupported intercepts length {}, expected 1 or {}", bsl.len(), t);
-            }
-        }
         Ok(Self {
             coefficients: coefficients.clone(), // clone to avoid move while slice borrowed
             intercepts,
@@ -114,10 +80,6 @@ impl LinearRegressorData {
             feat_c,
             coefficients_raw,
             coefficients_t,
-            prefer_transposed,
-            packed_tiled,
-            bias_scalar,
-            intercepts_vec,
         })
     }
 }
@@ -129,26 +91,8 @@ pub struct LinearRegressorOp {
 }
 
 impl LinearRegressorOp {
-    // Thread-local row buffer to handle non-contiguous inputs without heap churn
-    #[inline(always)]
-    fn with_rowbuf<F: FnOnce(&mut [f32]) -> R, R>(len: usize, f: F) -> R {
-        thread_local! {
-            static ROWBUF_TL_LR: std::cell::RefCell<SmallVec<f32, 256>> = std::cell::RefCell::new(SmallVec::new());
-        }
-        ROWBUF_TL_LR.with(|rb| {
-            let mut v = rb.borrow_mut();
-            let mut h = v.handle();
-            if h.len() < len {
-                h.resize(len, 0.0);
-            }
-            f(&mut h[..len])
-        })
-    }
-
-    // Bias helpers moved to crate::ml::bias
-
-    pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
-        // Normalize input view to 2D (n, c)
+    fn eval_internal(&self, input: ArrayViewD<f32>) -> TractResult<Array2<f32>> {
+        // Avoid use-after-move by separating len fetch.
         let input_2d: ArrayView2<f32> = if input.ndim() == 1 {
             let len = input.len();
             input.into_shape_with_order((1, len))?
@@ -161,89 +105,69 @@ impl LinearRegressorOp {
             bail!("Feature mismatch: model {} != input {}", self.data.feat_c, c);
         }
         let t = self.data.targets;
-
-        // Allocate output without zeroing
-        let mut out_tensor = unsafe { Tensor::uninitialized::<f32>(&[n, t]) }?;
-        let out_slice = out_tensor.as_slice_mut::<f32>()?;
-
-        // Matmul
-        unsafe {
-            let coef_rm: &[f32] = &self.data.coefficients_raw;
-            let coef_t: &[f32] = &self.data.coefficients_t;
-            let packed = self.data.packed_tiled.as_ref();
-            let use_t = self.data.prefer_transposed;
-
-            if let Some(x) = input_2d.as_slice() {
-                if t == 1 && packed.is_none() {
-                    // Dot per row
-                    let w = &coef_rm[..c];
-                    for i in 0..n {
-                        let row = &x[i * c..(i + 1) * c];
-                        out_slice[i * t] = math::dot_neon(row, w);
-                    }
-                } else if let Some(pk) = packed {
-                    pk.gemm_rows_contig(x, n, out_slice);
-                } else if use_t {
-                    math::matmul_rows_neon_contig_t(x, n, c, coef_t, t, out_slice);
-                } else {
-                    math::matmul_rows_neon_contig(x, n, c, coef_rm, t, out_slice);
+        let w = &self.data.coefficients_raw;
+        let mut out = Array2::<f32>::zeros((n, t));
+        // simple loops (targets usually small)
+        for i in 0..n {
+            let row = input_2d.row(i);
+            for target in 0..t {
+                let mut acc = 0f32;
+                for f in 0..c {
+                    acc += row[f] * w[target * c + f];
                 }
-            } else {
-                // Gathered path for strided/non-contiguous ndarray views
-                let base = input_2d.as_ptr();
-                // ndarray strides are in element counts already
-                let nd_strides = input_2d.strides();
-                let s0 = if n == 1 { 0 } else { nd_strides[0] as isize };
-                let s1 = nd_strides[1] as isize;
-                Self::with_rowbuf(c, |rowbuf| {
-                    if t == 1 && packed.is_none() {
-                        let w = &coef_rm[..c];
-                        for i in 0..n {
-                            // gather row i into rowbuf
-                            let mut k = 0usize;
-                            while k < c {
-                                let off = i as isize * s0 + k as isize * s1;
-                                rowbuf[k] = *base.offset(off);
-                                k += 1;
-                            }
-                            out_slice[i] = math::dot_neon(&rowbuf[..c], w);
-                        }
-                    } else if let Some(pk) = packed {
-                        pk.gemm_rows_gather(base, n, s0, s1, out_slice, rowbuf);
-                    } else if use_t {
-                        math::matmul_rows_neon_gather_t(
-                            base, n, c, s0, s1, coef_t, t, out_slice, rowbuf,
-                        );
-                    } else {
-                        math::matmul_rows_neon_gather(
-                            base, n, c, s0, s1, coef_rm, t, out_slice, rowbuf,
-                        );
-                    }
-                });
+                out[[i, target]] = acc;
             }
-
-            // Bias
-            for row in out_slice.chunks_mut(t) {
-                if let Some(b) = &self.data.intercepts_vec {
-                    bias::add_bias_neon_row(row, b);
-                } else if self.data.bias_scalar != 0.0 {
-                    bias::add_scalar_bias_neon(row, self.data.bias_scalar);
+        }
+        if let Some(intercepts) = &self.data.intercepts {
+            let b = intercepts.as_slice::<f32>()?;
+            if b.len() == t {
+                for i in 0..n {
+                    for target in 0..t {
+                        out[[i, target]] += b[target];
+                    }
                 }
-            }
-
-            // Post-transform
-            match self.post_transform {
-                PostTransformLR::None => {}
-                PostTransformLR::Logistic => {
-                    softmax::logistic_inplace_rows(out_slice, n, t);
-                }
-                PostTransformLR::Softmax => {
-                    softmax::softmax_inplace_rows(out_slice, n, t);
+            } else if b.len() == 1 {
+                let bias = b[0];
+                for v in out.iter_mut() {
+                    *v += bias;
                 }
             }
         }
+        match self.post_transform {
+            PostTransformLR::None => {}
+            PostTransformLR::Logistic => {
+                for v in out.iter_mut() {
+                    *v = 1.0 / (1.0 + (-*v).exp());
+                }
+            }
+            PostTransformLR::Softmax => {
+                // per-row softmax
+                for i in 0..n {
+                    let mut max_v = out[[i, 0]];
+                    for j in 1..t {
+                        let v = out[[i, j]];
+                        if v > max_v {
+                            max_v = v;
+                        }
+                    }
+                    let mut sum = 0f32;
+                    for j in 0..t {
+                        let v = (out[[i, j]] - max_v).exp();
+                        out[[i, j]] = v;
+                        sum += v;
+                    }
+                    let inv = 1.0 / sum;
+                    for j in 0..t {
+                        out[[i, j]] *= inv;
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
 
-        Ok(out_tensor)
+    pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
+        Ok(Tensor::from(self.eval_internal(input)?.into_dyn()))
     }
 }
 
@@ -294,7 +218,7 @@ fn dump(
     let coefficients =
         ast.konst_variable(format!("{}_coefficients", node.name), &op.data.coefficients)?;
     let mut args = vec![input, coefficients];
-    let named = vec![
+    let mut named = vec![
         ("targets", numeric(op.data.targets as i64)),
         (
             "post_transform",

@@ -236,11 +236,91 @@ mod test_x86_64_fma_softmax2_fastcompact_f32_32n {
     );
 }
 
+map_reduce_impl_wrap!(
+    f32,
+    x86_64_avx512_softmax2_fastcompact_f32_64n,
+    64,
+    16,
+    f32,
+    f32::MIN,
+    0f32,
+    #[inline(never)]
+    fn run(buf: &mut [f32], max: f32) -> f32 {
+        assert!(buf.len() % 64 == 0);
+        assert!(!buf.is_empty());
+        unsafe { avx512_softmax2_fastcompact_f32_run(buf, max) }
+    },
+    #[inline(never)]
+    fn reduce_two(a: f32, b: f32) -> f32 {
+        a + b
+    }
+);
+
+#[target_feature(enable = "avx512f")]
+unsafe fn avx512_softmax2_fastcompact_f32_run(buf: &mut [f32], max: f32) -> f32 {
+    use std::arch::x86_64::*;
+    let mut sum = 0f32;
+    const MLN2: f32 = 0.6931471805f32;
+    const A: f32 = 8388608.0f32;
+    const B: f32 = 1065353216.0f32;
+    const C: f32 = 60801.0f32;
+    const SLOPE: f32 = A / MLN2;
+    const OFFSET: f32 = B - C;
+
+    let zmax = _mm512_set1_ps(max);
+    let zzero = _mm512_set1_ps(0.0);
+    let zslope = _mm512_set1_ps(SLOPE);
+    let zoffset = _mm512_set1_ps(OFFSET);
+
+    let mut i = 0;
+    while i < buf.len() {
+        let mut z0 = _mm512_loadu_ps(buf.as_ptr().add(i));
+        let mut z1 = _mm512_loadu_ps(buf.as_ptr().add(i + 16));
+        let mut z2 = _mm512_loadu_ps(buf.as_ptr().add(i + 32));
+        let mut z3 = _mm512_loadu_ps(buf.as_ptr().add(i + 48));
+
+        z0 = _mm512_sub_ps(z0, zmax);
+        z1 = _mm512_sub_ps(z1, zmax);
+        z2 = _mm512_sub_ps(z2, zmax);
+        z3 = _mm512_sub_ps(z3, zmax);
+
+        let t0 = _mm512_max_ps(_mm512_fmadd_ps(z0, zslope, zoffset), zzero);
+        let t1 = _mm512_max_ps(_mm512_fmadd_ps(z1, zslope, zoffset), zzero);
+        let t2 = _mm512_max_ps(_mm512_fmadd_ps(z2, zslope, zoffset), zzero);
+        let t3 = _mm512_max_ps(_mm512_fmadd_ps(z3, zslope, zoffset), zzero);
+
+        let i0 = _mm512_cvtps_epi32(t0);
+        let i1 = _mm512_cvtps_epi32(t1);
+        let i2 = _mm512_cvtps_epi32(t2);
+        let i3 = _mm512_cvtps_epi32(t3);
+
+        let e0 = _mm512_castsi512_ps(i0);
+        let e1 = _mm512_castsi512_ps(i1);
+        let e2 = _mm512_castsi512_ps(i2);
+        let e3 = _mm512_castsi512_ps(i3);
+
+        _mm512_storeu_ps(buf.as_mut_ptr().add(i), e0);
+        _mm512_storeu_ps(buf.as_mut_ptr().add(i + 16), e1);
+        _mm512_storeu_ps(buf.as_mut_ptr().add(i + 32), e2);
+        _mm512_storeu_ps(buf.as_mut_ptr().add(i + 48), e3);
+
+        let mut tmp = [0f32; 64];
+        _mm512_storeu_ps(tmp.as_mut_ptr(), e0);
+        _mm512_storeu_ps(tmp.as_mut_ptr().add(16), e1);
+        _mm512_storeu_ps(tmp.as_mut_ptr().add(32), e2);
+        _mm512_storeu_ps(tmp.as_mut_ptr().add(48), e3);
+        sum += tmp.iter().sum::<f32>();
+
+        i += 64;
+    }
+    sum
+}
+
 #[cfg(test)]
 mod test_x86_64_avx512_softmax2_fastcompact_f32_64n {
     use super::*;
     crate::softmax_l2_frame_tests!(
-        is_x86_feature_detected!("avx512f"),
+        std::is_x86_feature_detected!("avx512f"),
         f32,
         x86_64_avx512_softmax2_fastcompact_f32_64n
     );

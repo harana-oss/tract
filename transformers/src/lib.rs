@@ -12,6 +12,7 @@ pub fn get_transform(name: &str) -> Option<Box<dyn ModelTransform>> {
         "detect-scaled-masked-softmax" => Some(Box::new(ScaledMaskedSoftmaxTransform)),
         "detect-gelu-approx" => Some(Box::new(GeluTransform)),
         "detect-kv-cache" => Some(Box::new(KeyValueCacheTransform)),
+        "detect-sdpa-kv-cache-broadcast" => Some(Box::new(SdpaFuseKvCacheBroadcastTransform)),
         "transformers-detect-all" => Some(Box::new(TransformersTransform)),
         _ => None,
     }
@@ -25,6 +26,7 @@ pub fn register(registry: &mut Registry) {
     ops::gelu_approximate::register(registry);
     ops::apply_rope::register(registry);
     ops::scaled_masked_softmax::register(registry);
+    ops::sdpa::register(registry);
 }
 
 pub trait WithTractTransformers {

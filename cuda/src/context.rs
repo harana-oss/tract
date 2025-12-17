@@ -70,7 +70,6 @@ impl TractCudaContext {
     }
 
     pub fn preload_pipelines(&self) -> TractResult<()> {
-        // TODO: Investigate CUDA lazy loading
         for ew_func in crate::kernels::UnaryOps::all_functions() {
             let _ = self.load_pipeline(LibraryName::Unary, ew_func);
         }
@@ -78,6 +77,15 @@ impl TractCudaContext {
         for bin_func in crate::kernels::BinOps::all_functions() {
             let _ = self.load_pipeline(LibraryName::Binary, bin_func);
         }
+
+        for arr_func in crate::kernels::array::all_functions() {
+            let _ = self.load_pipeline(LibraryName::Array, arr_func);
+        }
+
+        for nn_func in crate::kernels::nn::all_functions() {
+            let _ = self.load_pipeline(LibraryName::NN, nn_func);
+        }
+
         Ok(())
     }
 
@@ -146,7 +154,14 @@ impl DeviceContext for TractCudaContext {
         shape: &[usize],
         dt: DatumType,
     ) -> TractResult<Box<dyn OwnedDeviceTensor>> {
-        Ok(Box::new(CudaTensor::uninitialized_dt(shape, dt)))
+        Ok(Box::new(CudaTensor::uninitialized_dt(shape, dt)?))
+    }
+
+    fn uninitialized_device_opaque_tensor(
+        &self,
+        opaque_fact: Box<dyn OpaqueFact>,
+    ) -> TractResult<Box<dyn OwnedDeviceTensor>> {
+        Ok(Box::new(CudaTensor::uninitialized_opaque(opaque_fact)?))
     }
 }
 

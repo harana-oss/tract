@@ -4,12 +4,13 @@ use cudarc::driver::{CudaSlice, DevicePtr};
 use tract_core::internal::tract_smallvec::ToSmallVec;
 use tract_core::internal::*;
 use tract_core::prelude::{DatumType, TVec};
-use tract_core::tract_linalg::block_quant::{BlockQuantFact, BlockQuantValue, Q4_0};
+use tract_core::tract_linalg::block_quant::{BlockQuantFact, BlockQuantValue, Q8_1};
 use tract_gpu::device::DeviceBuffer;
 use tract_gpu::tensor::{DeviceTensor, OwnedDeviceTensor};
 use tract_gpu::utils::{as_q40_tensor, check_strides_validity};
 
 use crate::context::CUDA_STREAM;
+use crate::ops::GgmlQuantQ81Fact;
 
 #[derive(Debug, Clone)]
 pub struct CudaBuffer {
@@ -35,13 +36,13 @@ pub struct CudaTensor {
     datum_type: DatumType,
     shape: TVec<usize>,
     strides: TVec<isize>,
-    block_quant_fact: Option<BlockQuantFact>,
+    opaque_fact: Option<Box<dyn OpaqueFact>>,
 }
 
 impl CudaTensor {
     pub fn from_tensor(tensor: &Tensor) -> TractResult<Self> {
         let (data, bqf) = as_q40_tensor(tensor)
-            .map(|bqv| (bqv.value.as_bytes(), Some(bqv.fact.clone())))
+            .map(|bqv| (bqv.value.as_bytes(), Some(bqv.fact.clone().into())))
             .unwrap_or((tensor.as_bytes(), None));
         CUDA_STREAM.with(|stream| {
             let device_data = stream
@@ -53,27 +54,63 @@ impl CudaTensor {
                 datum_type: tensor.datum_type(),
                 shape: tensor.shape().into(),
                 strides: tensor.strides().into(),
-                block_quant_fact: bqf,
+                opaque_fact: bqf,
             })
         })
     }
 
-    pub fn uninitialized_dt(shape: &[usize], dt: DatumType) -> Self {
+    pub fn uninitialized_dt(shape: &[usize], dt: DatumType) -> TractResult<Self> {
         CUDA_STREAM.with(|stream| unsafe {
             let device_data = stream.alloc(shape.iter().product::<usize>() * dt.size_of()).unwrap();
             let buffer = Arc::new(CudaBuffer { inner: device_data });
-            CudaTensor {
+            Ok(CudaTensor {
                 buffer,
                 datum_type: dt,
                 shape: shape.to_smallvec(),
                 strides: natural_strides(shape),
-                block_quant_fact: None,
-            }
+                opaque_fact: None,
+            })
         })
     }
 
-    pub fn block_quant_fact(&self) -> Option<BlockQuantFact> {
-        self.block_quant_fact.clone()
+    pub fn uninitialized_opaque(opaque_fact: Box<dyn OpaqueFact>) -> TractResult<Self> {
+        if let Some(bqf) = opaque_fact.downcast_ref::<BlockQuantFact>() {
+            let shape = bqf.shape();
+            let format = bqf.format.clone();
+            let len = shape.iter().product::<usize>();
+            ensure!(len % format.block_len() == 0);
+            CUDA_STREAM.with(|stream| unsafe {
+                let device_data = stream.alloc(len * format.block_bytes() / format.block_len())?;
+                let buffer = Arc::new(CudaBuffer { inner: device_data });
+                Ok(CudaTensor {
+                    buffer,
+                    datum_type: DatumType::Opaque,
+                    shape: tvec!(),
+                    strides: tvec!(),
+                    opaque_fact: Some(Box::new(bqf.clone())),
+                })
+            })
+        } else if let Some(ggml_q81_fact) = opaque_fact.downcast_ref::<GgmlQuantQ81Fact>() {
+            let mem_size = ggml_q81_fact.mem_size().as_i64().unwrap() as usize;
+
+            CUDA_STREAM.with(|stream| unsafe {
+                let device_data = stream.alloc(mem_size)?;
+                let buffer = Arc::new(CudaBuffer { inner: device_data });
+                Ok(CudaTensor {
+                    buffer,
+                    datum_type: DatumType::Opaque,
+                    shape: tvec!(),
+                    strides: tvec!(),
+                    opaque_fact: Some(Box::new(ggml_q81_fact.clone())),
+                })
+            })
+        } else {
+            bail!("Unsupported opaque type")
+        }
+    }
+
+    pub fn opaque_fact(&self) -> Option<&dyn OpaqueFact> {
+        self.opaque_fact.as_deref()
     }
 }
 
@@ -82,7 +119,7 @@ impl std::fmt::Debug for CudaTensor {
         f.debug_struct("CudaTensor")
             .field("datum_type", &self.datum_type)
             .field("shape", &self.shape)
-            .field("block_quant_fact", &self.block_quant_fact)
+            .field("block_quant_fact", &self.opaque_fact)
             .finish()
     }
 }
@@ -135,16 +172,25 @@ impl OwnedDeviceTensor for CudaTensor {
 
     fn to_host(&self) -> TractResult<Arc<Tensor>> {
         CUDA_STREAM.with(|stream| {
-            let res = stream.memcpy_dtov(&self.buffer.inner)?;
-
-            let t: Tensor = if let Some(bqf) = &self.block_quant_fact {
-                ensure!(bqf.format.same_as(&Q4_0));
+            let t: Tensor = if let Some(of) = &self.opaque_fact {
                 ensure!(self.shape.iter().product::<usize>() == 1, "Only support Scalar Opaque");
-                let bqv =
-                    BlockQuantValue { fact: bqf.clone(), value: Arc::new(Blob::from_bytes(&res)?) };
+                let mut blob =
+                    unsafe { Blob::new_for_size_and_align(self.buffer.len(), vector_size()) };
+                stream.memcpy_dtoh(&self.buffer.inner, blob.as_bytes_mut())?;
+                let bqf = if let Some(bqf) = of.downcast_ref::<BlockQuantFact>() {
+                    (*bqf).clone()
+                } else if let Some(ggml_q81) = of.downcast_ref::<GgmlQuantQ81Fact>() {
+                    let out_shape = ggml_q81.concrete_out_shape()?;
+                    BlockQuantFact::new(Box::new(Q8_1), out_shape.into())
+                } else {
+                    bail!("Unknown Opaque Fact")
+                };
+                let bqv = BlockQuantValue { fact: bqf, value: Arc::new(blob) };
                 Opaque(Arc::new(bqv)).into()
             } else {
-                unsafe { Tensor::from_raw_dt(self.datum_type, &self.shape, &res)? }
+                let mut tensor = unsafe { Tensor::uninitialized_dt(self.datum_type, &self.shape)? };
+                stream.memcpy_dtoh(&self.buffer.inner, tensor.as_bytes_mut())?;
+                tensor
             };
 
             Ok(Arc::new(t.into_shape(&self.shape)?))

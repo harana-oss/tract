@@ -1,6 +1,6 @@
 [package]
 name = "tract"
-version = "0.21.14-pre"
+version = "0.22.1-pre"
 authors = [ "Romain Liautaud <romain.liautaud@snips.ai>", "Mathieu Poumeyrol <kali@zoy.org>"]
 license = "MIT OR Apache-2.0"
 description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
@@ -58,6 +58,8 @@ tract-tensorflow = { workspace = true, optional = true }
 tract-tflite = { workspace = true, optional = true }
 tract-transformers = { workspace = true, optional = true }
 zerofrom.workspace = true
+float-ord.workspace = true
+levenshtein-diff.workspace = true
 
 [target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
 tract-metal.workspace = true

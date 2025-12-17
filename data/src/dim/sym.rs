@@ -1,47 +1,19 @@
-use dashmap::DashMap;
 use itertools::Itertools;
-use parking_lot::RwLock;
+use parking_lot::ReentrantMutex;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fmt::{self, Display};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Weak};
 use string_interner::DefaultStringInterner;
 use string_interner::Symbol as _;
-// (previous qcell usage removed)
 
 use crate::TractResult;
 
 use super::parse::parse_assertion;
-use super::{Assertion, TDim, parse_tdim};
+use super::{parse_tdim, Assertion, TDim};
 
-type ScopeId = u64;
-type PerScopeSymbolsCache = HashMap<super::TDim, HashSet<Symbol>>;
-
-#[derive(Clone)]
-pub struct SymbolScope(pub Arc<RwLock<SymbolScopeData>>);
-
-static SCOPE_REGISTRY: OnceLock<DashMap<u64, SymbolScope>> = OnceLock::new();
-static NEXT_SCOPE_ID: AtomicU64 = AtomicU64::new(1);
-
-thread_local! {
-    static TLS_SCOPE_CACHE: RefCell<HashMap<u64, SymbolScope>> = RefCell::new(HashMap::new());
-    static TLS_SYMBOLS_CACHE: RefCell<HashMap<ScopeId, PerScopeSymbolsCache>> = RefCell::new(HashMap::new());
-}
-
-impl Default for SymbolScope {
-    fn default() -> Self {
-        let id = NEXT_SCOPE_ID.fetch_add(1, Ordering::Relaxed);
-        let data = SymbolScopeData { id, ..Default::default() };
-        let arc = Arc::new(RwLock::new(data));
-        let scope = SymbolScope(Arc::clone(&arc));
-        SCOPE_REGISTRY.get_or_init(DashMap::new).insert(id, scope.clone());
-        TLS_SCOPE_CACHE.with(|c| {
-            c.borrow_mut().insert(id, scope);
-        });
-        SymbolScope(arc)
-    }
-}
+#[derive(Clone, Default)]
+pub struct SymbolScope(pub Arc<ReentrantMutex<RefCell<SymbolScopeData>>>);
 
 impl PartialEq for SymbolScope {
     fn eq(&self, other: &Self) -> bool {
@@ -53,7 +25,6 @@ impl Eq for SymbolScope {}
 
 #[derive(Default)]
 pub struct SymbolScopeData {
-    id: u64,
     table: DefaultStringInterner,
     assertions: Vec<Assertion>,
     scenarios: Vec<(String, Vec<Assertion>)>,
@@ -61,19 +32,21 @@ pub struct SymbolScopeData {
 
 impl SymbolScope {
     pub fn get(&self, name: &str) -> Option<Symbol> {
-        let locked = self.0.read();
-        locked.table.get(name).map(|sym| Symbol(locked.id, sym))
+        let locked = self.0.lock();
+        let locked = locked.borrow();
+        locked.table.get(name).map(|sym| Symbol(Arc::downgrade(&self.0), sym))
     }
 
     pub fn sym(&self, name: &str) -> Symbol {
-        let mut locked = self.0.write();
+        let locked = self.0.lock();
+        let mut locked = locked.borrow_mut();
         let sym = locked.table.get_or_intern(name);
-        let id = locked.id;
-        Symbol(id, sym)
+        Symbol(Arc::downgrade(&self.0), sym)
     }
 
     pub fn new_with_prefix(&self, prefix: &str) -> Symbol {
-        let mut locked = self.0.write();
+        let locked = self.0.lock();
+        let mut locked = locked.borrow_mut();
         let sym = if locked.table.get(prefix).is_none() {
             locked.table.get_or_intern(prefix)
         } else {
@@ -86,8 +59,7 @@ impl SymbolScope {
                 i += 1;
             }
         };
-        let id = locked.id;
-        Symbol(id, sym)
+        Symbol(Arc::downgrade(&self.0), sym)
     }
 
     pub fn parse_tdim(&self, input: impl AsRef<str>) -> TractResult<TDim> {
@@ -97,7 +69,8 @@ impl SymbolScope {
     pub fn add_assertion(&self, assert: impl Into<String>) -> TractResult<()> {
         let assert = assert.into();
         let assert = parse_assertion(self, &assert)?;
-        let mut locked = self.0.write();
+        let locked = self.0.lock();
+        let mut locked = locked.borrow_mut();
         locked.assertions.push(assert);
         Ok(())
     }
@@ -108,17 +81,20 @@ impl SymbolScope {
     }
 
     pub fn all_assertions(&self) -> Vec<Assertion> {
-        let locked = self.0.read();
+        let locked = self.0.lock();
+        let locked = locked.borrow();
         locked.assertions.clone()
     }
 
     pub fn all_scenarios(&self) -> impl IntoIterator<Item = (String, Vec<Assertion>)> {
-        let locked = self.0.read();
+        let locked = self.0.lock();
+        let locked = locked.borrow();
         locked.scenarios.clone()
     }
 
     pub fn add_scenario(&self, scenario: impl Into<String>) -> TractResult<()> {
-        let mut locked = self.0.write();
+        let locked = self.0.lock();
+        let mut locked = locked.borrow_mut();
         let s = scenario.into();
         if !locked.scenarios.iter().any(|sc| sc.0 == s) {
             locked.scenarios.push((s, vec![]));
@@ -133,7 +109,8 @@ impl SymbolScope {
     ) -> TractResult<()> {
         let assert = parse_assertion(self, &assertion.into())?;
         let s = scenario.into();
-        let mut locked = self.0.write();
+        let locked = self.0.lock();
+        let mut locked = locked.borrow_mut();
         if let Some(s) = locked.scenarios.iter_mut().find(|sc| sc.0 == s) {
             s.1.push(assert);
         } else {
@@ -157,13 +134,18 @@ impl SymbolScope {
     }
 
     pub fn all_symbols(&self) -> Vec<Symbol> {
-        let lock = self.0.read();
-        let id = lock.id;
-        lock.table.into_iter().map(|is| Symbol(id, is.0)).collect()
+        self.0
+            .lock()
+            .borrow()
+            .table
+            .into_iter()
+            .map(|is| Symbol(Arc::downgrade(&self.0), is.0))
+            .collect()
     }
 
     pub fn guess_scenario(&self, values: &SymbolValues) -> TractResult<Option<usize>> {
-        let locked = self.0.read();
+        let locked = self.0.lock();
+        let locked = locked.borrow();
         if locked.scenarios.len() == 0 {
             return Ok(None);
         }
@@ -214,20 +196,6 @@ impl SymbolScopeData {
         self.table.resolve(sym.1).map(f)
     }
 
-    pub(crate) fn symbols_cache_get(&self, key: &super::TDim) -> Option<HashSet<Symbol>> {
-        let id = self.id as ScopeId;
-        TLS_SYMBOLS_CACHE.with(|c| c.borrow().get(&id).and_then(|m| m.get(key).cloned()))
-    }
-
-    pub(crate) fn symbols_cache_put(&self, key: super::TDim, value: HashSet<Symbol>) {
-        let id = self.id as ScopeId;
-        TLS_SYMBOLS_CACHE.with(|c| {
-            let mut cache = c.borrow_mut();
-            let per_scope = cache.entry(id).or_insert_with(HashMap::new);
-            per_scope.insert(key, value);
-        });
-    }
-
     #[allow(clippy::mutable_key_type)]
     pub fn prove_positive_or_zero(&self, t: &TDim) -> bool {
         if let TDim::Val(v) = t {
@@ -274,7 +242,8 @@ impl SymbolScopeData {
 
 impl fmt::Debug for SymbolScope {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let locked = self.0.read();
+        let locked = self.0.lock();
+        let locked = locked.borrow();
         write!(
             f,
             "symbols: {}; assertions: {}; {}",
@@ -293,8 +262,8 @@ impl fmt::Debug for SymbolScope {
     }
 }
 
-#[derive(Copy, Clone)]
-pub struct Symbol(u64, string_interner::DefaultSymbol);
+#[derive(Clone)]
+pub struct Symbol(Weak<ReentrantMutex<RefCell<SymbolScopeData>>>, string_interner::DefaultSymbol);
 
 impl Eq for Symbol {}
 
@@ -306,20 +275,7 @@ impl PartialEq for Symbol {
 
 impl Symbol {
     pub fn scope(&self) -> Option<SymbolScope> {
-        let id = self.0;
-
-        TLS_SCOPE_CACHE.with(|c| {
-            if let Some(scope) = { c.borrow().get(&id).cloned() } {
-                return Some(scope);
-            }
-            if let Some(entry) = SCOPE_REGISTRY.get_or_init(DashMap::new).get(&id) {
-                let scope = entry.value().clone();
-                c.borrow_mut().insert(id, scope.clone());
-                Some(scope)
-            } else {
-                None
-            }
-        })
+        self.0.upgrade().map(SymbolScope)
     }
 }
 
@@ -344,7 +300,8 @@ impl std::hash::Hash for Symbol {
 impl std::fmt::Display for Symbol {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(scope) = self.scope() {
-            let lock = scope.0.read();
+            let lock = scope.0.lock();
+            let lock = lock.borrow();
             if let Some(s) = lock.table.resolve(self.1) {
                 return write!(f, "{s}");
             }
@@ -365,18 +322,15 @@ pub struct SymbolValues {
 }
 
 impl SymbolValues {
-    #[inline]
     pub fn with(mut self, s: &Symbol, v: i64) -> Self {
         self.set(s, v);
         self
     }
 
-    #[inline]
     pub fn set(&mut self, s: &Symbol, v: i64) {
-        self.values.insert(*s, v);
+        self.values.insert(s.clone(), v);
     }
 
-    #[inline]
     pub fn get(&self, s: &Symbol) -> Option<i64> {
         self.values.get(s).copied()
     }

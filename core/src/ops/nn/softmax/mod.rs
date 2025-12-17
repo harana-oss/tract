@@ -141,82 +141,42 @@ impl EvalOp for Softmax {
 impl Softmax {
     fn eval_t<T>(&self, input: TValue) -> TractResult<TVec<TValue>>
     where
-        T: Float + Datum + std::iter::Sum + Debug,
+        T: Float + Datum + std::iter::Sum,
     {
-        let __start = std::time::Instant::now();
-
-        let __t_iter_shape = std::time::Instant::now();
         let mut iterating_shape: TVec<usize> = input.shape().into();
+
         for i in 0..iterating_shape.len() {
             if self.axes.contains(&i) {
                 iterating_shape[i] = 1
             }
         }
 
-        let __t_view = std::time::Instant::now();
         let mut output = input.into_tensor();
         let mut view = output.to_array_view_mut::<T>()?;
 
-        let __t_loop = std::time::Instant::now();
         for it_coords in tract_ndarray::indices(&*iterating_shape) {
-            let __t_collapse = std::time::Instant::now();
             let mut view = view.view_mut();
             for ix in 0..iterating_shape.len() {
                 if !self.axes.contains(&ix) {
                     view.collapse_axis(Axis(ix), it_coords[ix]);
                 }
             }
-            let __collapse_ns = __t_collapse.elapsed().as_nanos();
-
-            let __t_compute = std::time::Instant::now();
-            let mut __compute_path = "generic";
-            let __dt = T::datum_type();
-            {
-                if let Some(__s) = view.as_slice_mut() {
-                    // log::info!(
-                    //     "task=softmax_eval_t_as_slice dt={:?} len={} values={:?}",
-                    //     __dt,
-                    //     __s.len(),
-                    //     __s
-                    // );
-                } else {
-                    // log::info!(
-                    //     "task=softmax_eval_t_as_slice dt={:?} len=NA values=NON_CONTIGUOUS",
-                    //     __dt
-                    // );
-                }
-            }
             if let Some(slice) =
                 view.as_slice_mut().filter(|_| T::datum_type() == f32::datum_type())
             {
                 let slice: &mut [f32] = unsafe { std::mem::transmute(slice) };
-                __compute_path = "f32";
                 self.softmax_inner_slice_f32(slice, self.kind)?;
             } else if let Some(slice) =
                 view.as_slice_mut().filter(|_| T::datum_type() == f16::datum_type())
             {
                 let slice: &mut [f16] = unsafe { std::mem::transmute(slice) };
-                __compute_path = "f16";
                 self.softmax_inner_slice_f16(slice, self.kind)?;
             } else {
                 softmax_inner(view, self.kind);
             }
-            let __compute_ns = __t_compute.elapsed().as_nanos();
-            let __total_ns = __collapse_ns + __compute_ns;
-            // log::info!(
-            //     "task=softmax_eval_t_loop collapse_ns={} compute_ns={} total_ns={} path={}",
-            //     __collapse_ns,
-            //     __compute_ns,
-            //     __total_ns,
-            //     __compute_path
-            // );
         }
-        let __loop_ns = __t_loop.elapsed().as_nanos();
-        // log::info!("task=softmax_eval_t_loop total_ns={}", __loop_ns);
 
-        let res = tvec!(output.into_tvalue());
-        // log::info!("task=softmax_eval_t ms={}", __start.elapsed().as_millis());
-        Ok(res)
+        Ok(tvec!(output.into_tvalue()))
     }
 
     fn eval_quant(&self, input: TValue) -> TractResult<TVec<TValue>> {
@@ -256,16 +216,11 @@ impl Softmax {
     }
 
     fn softmax_inner_slice_f16(&self, slice: &mut [f16], kind: SoftmaxKind) -> TractResult<()> {
-        let start_max = std::time::Instant::now();
         let max = (tract_linalg::ops().max_f16)().run(slice)?;
-        let elapsed_max = start_max.elapsed();
-        log::info!("task=softmax_max_f16 ms={}", elapsed_max.as_millis());
         match kind {
             SoftmaxKind::Softmax(exp_impl) => {
-                let mut timer: Option<std::time::Instant> = None;
                 let sum = match exp_impl {
                     SoftmaxExp::Libc => {
-                        timer = Some(std::time::Instant::now());
                         let mut s = f16::zero();
                         slice.iter_mut().for_each(|x| {
                             *x = (*x - max).exp();
@@ -278,10 +233,6 @@ impl Softmax {
                 };
                 let rsum = sum.recip();
                 (tract_linalg::ops().mul_by_scalar_f16)().run_with_params(slice, rsum)?;
-                if let Some(start) = timer {
-                    let elapsed = start.elapsed();
-                    log::info!("task=softmax_libc_f16 ms={}", elapsed.as_millis());
-                }
             }
             SoftmaxKind::LogSoftmax => {
                 let mut exp_sum = f16::zero();
@@ -297,16 +248,11 @@ impl Softmax {
     }
 
     fn softmax_inner_slice_f32(&self, slice: &mut [f32], kind: SoftmaxKind) -> TractResult<()> {
-        let start_max = std::time::Instant::now();
         let max = (tract_linalg::ops().max_f32)().run(slice)?;
-        let elapsed_max = start_max.elapsed();
-        // log::info!("task=softmax_max_f32 ms={}", elapsed_max.as_millis());
         match kind {
             SoftmaxKind::Softmax(exp_impl) => {
-                let mut timer: Option<std::time::Instant> = None;
                 let sum = match exp_impl {
                     SoftmaxExp::Libc => {
-                        timer = Some(std::time::Instant::now());
                         let mut s = f32::zero();
                         slice.iter_mut().for_each(|x| {
                             *x = (*x - max).exp();
@@ -319,10 +265,6 @@ impl Softmax {
                 };
                 let rsum = sum.recip();
                 (tract_linalg::ops().mul_by_scalar_f32)().run_with_params(slice, rsum)?;
-                if let Some(start) = timer {
-                    let elapsed = start.elapsed();
-                    // log::info!("task=softmax_libc_f32 ms={}", elapsed.as_millis());
-                }
             }
             SoftmaxKind::LogSoftmax => {
                 let mut exp_sum = f32::zero();
@@ -342,22 +284,10 @@ fn softmax_inner<T: Float + Datum + std::iter::Sum, D: Dimension>(
     mut view: ArrayViewMut<T, D>,
     kind: SoftmaxKind,
 ) {
-    let __t_all = std::time::Instant::now();
-
-    let __t_max = std::time::Instant::now();
     let max =
         *view.iter().max_by(|i, j| i.partial_cmp(j).unwrap_or(std::cmp::Ordering::Less)).unwrap();
-    let __max_ns = __t_max.elapsed().as_nanos();
-
-    let __t_sub = std::time::Instant::now();
     view.mapv_inplace(|x| x - max);
-    let __sub_ns = __t_sub.elapsed().as_nanos();
-
-    let __t_sum = std::time::Instant::now();
-    let exp_sum: T = view.iter().map(|&x| x.exp()).sum();
-    let __sum_ns = __t_sum.elapsed().as_nanos();
-
-    let __t_norm = std::time::Instant::now();
+    let exp_sum = view.iter().map(|&x| x.exp()).sum();
     match kind {
         SoftmaxKind::Softmax(_) => {
             view.mapv_inplace(|x| x.exp() / exp_sum);
@@ -367,19 +297,6 @@ fn softmax_inner<T: Float + Datum + std::iter::Sum, D: Dimension>(
             view.mapv_inplace(|x| x - log_sum);
         }
     }
-    let __norm_ns = __t_norm.elapsed().as_nanos();
-
-    let __total_ns = __t_all.elapsed().as_nanos();
-    log::info!(
-        "task=softmax_inner len={} max_ns={} sub_ns={} sum_ns={} norm_ns={} total_ns={} kind={:?}",
-        view.len(),
-        __max_ns,
-        __sub_ns,
-        __sum_ns,
-        __norm_ns,
-        __total_ns,
-        kind
-    );
 }
 
 fn softmax_quant_inner<D: Dimension>(
@@ -751,7 +668,7 @@ mod test {
         prob.check()?;
         Ok(())
     }
-
+    
     #[test]
     fn test_inner_softmax_1() -> Result<()> {
         let in_qp = ZpScale { zero_point: 0, scale: 0.03125 };

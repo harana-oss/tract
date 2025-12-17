@@ -23,12 +23,8 @@ pub struct DeviceFact {
 impl DeviceFact {
     pub fn new(origin: DeviceTensorOrigin, fact: TypedFact) -> TractResult<Self> {
         ensure!(fact.as_device_fact().is_none());
-        let mut fact_wo_cst = fact.clone();
-        if fact.opaque_fact.is_some() {
-            fact_wo_cst.konst = None;
-            fact_wo_cst.uniform = None;
-        }
-        Ok(Self { origin, fact: fact_wo_cst })
+        let new_fact = fact.without_value();
+        Ok(Self { origin, fact: new_fact })
     }
 
     pub fn from_host(fact: TypedFact) -> TractResult<Self> {
@@ -53,13 +49,19 @@ impl DeviceFact {
 }
 
 impl OpaqueFact for DeviceFact {
-    fn clarify_dt_shape(&self) -> Option<(DatumType, &[usize])> {
-        self.fact.shape.as_concrete().map(|s| (self.fact.datum_type, s))
+    fn clarify_dt_shape(&self) -> Option<(DatumType, TVec<TDim>)> {
+        Some((self.fact.datum_type, self.fact.shape.to_tvec()))
     }
 
-    fn mem_size(&self) -> TDim {
-        self.fact.mem_size()
+    fn buffer_sizes(&self) -> TVec<TDim> {
+        let inner_fact = &self.fact;
+        let mut sizes = tvec!(inner_fact.shape.volume() * inner_fact.datum_type.size_of());
+        if let Some(of) = inner_fact.opaque_fact() {
+            sizes.extend(of.buffer_sizes());
+        }
+        sizes
     }
+
     fn same_as(&self, other: &dyn OpaqueFact) -> bool {
         other.downcast_ref::<Self>().is_some_and(|o| o == self)
     }

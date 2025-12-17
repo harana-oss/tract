@@ -1,8 +1,8 @@
 use tract_nnef::internal::*;
 use tract_nnef::prelude::tract_itertools::Itertools;
+use tract_nnef::tract_core::ops::OpStateFreeze;
 use tract_nnef::tract_core::ops::array::TypedConcat;
 use tract_nnef::tract_core::ops::source::TypedSource;
-use tract_nnef::tract_core::ops::OpStateFreeze;
 
 use crate::rule_ensure;
 
@@ -80,8 +80,8 @@ impl OpState for DynKeyValueCacheState {
         }
     }
 
-    fn init_tensor_fact(&self) -> Option<TypedFact> {
-        Some(self.past_sequence_fact.clone())
+    fn init_tensor_fact(&self) -> Option<(String, TypedFact)> {
+        Some((self.name.clone(), self.past_sequence_fact.clone()))
     }
 
     fn resolve_symbols(&mut self, state: &mut SessionState) -> TractResult<()> {

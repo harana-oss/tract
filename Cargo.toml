@@ -147,12 +147,12 @@ dyn-hash = "0.2"
 env_logger = "0.10"
 flatbuffers = "23.1.21"
 flate2 = "1.0.20"
+float-ord = "0.3.2"
 foreign-types = "0.5"
 fs-err = "2"
 fs2 = "0.4.3"
-gdt-cpus = "25.5.0"
 getrandom = "0.2"
-half = { version="2.4.1", features = [ "std", "num-traits" ] }
+half = { version=">=2.4,<3.0", features = [ "std", "num-traits" ] }
 home = "0.5.9"
 icu_collections = "1.5.1"
 icu_normalizer = "1.5.0"
@@ -163,7 +163,8 @@ idna_adapter = "1.2.0"
 image = "0.24.1"
 itertools = "0.12.1"
 lazy_static = "1.5.0"
-libc = "0.2.177"
+levenshtein-diff = "0.2.4"
+libc = "0.2.164"
 libm = "0.2.11"
 liquid = "0.26.8"
 liquid-core = "0.26.8"
@@ -183,11 +184,8 @@ num-complex = "0.4.0"
 num-integer = "0.1.44"
 num-traits = "0.2.14"
 num_cpus = "1"
-openblas-src = { version = "0.10", features = ["static"] }
-orx-parallel = "3"
+openblas-src = { version = "0.10.13", features = ["static"] }
 pastey = "0.1"
-par-core = { version = "2", features = ["chili"] }
-par-iter = "2"
 potential_utf = "0.1.0"
 proptest = "1.0.0"
 prost = "0.11.0"
@@ -197,7 +195,7 @@ rand = { version = "0.8.4", features = ["small_rng"] }
 rand_xoshiro = "0.6"
 rand_distr = "0.4"
 rayon = "1.10"
-readings-probe = "0.1.7"
+readings-probe = "0.1.8"
 regex = "1.5.4"
 reqwest = { version = "0.12", features = [ "blocking", "rustls-tls" ], default-features = false }
 rustfft = { version = "6.1", features = [ "neon" ] }
@@ -207,7 +205,6 @@ safetensors = "0.6"
 scan_fmt = "0.2.6"
 serde = { version = "1.0.127", features = [ "derive" ] }
 serde_json = "1.0"
-simsimd = "6"
 smallvec = "1.6.1"
 snmalloc-rs = "0.3"
 string-interner = "0.15"
@@ -219,41 +216,37 @@ tflitec = { git = "https://github.com/kali/tflitec-rs.git", rev="9ceb838" }
 time = "0.3.23"
 time-macros = "0.2.10"
 tinystr = "0.8.0"
-tinyvec = "1.6.0"
 tokenizers = "0.21"
 unicode-normalization = "0.1.19"
 walkdir = "2.3.2"
 writeable = "0.6.0"
 zerofrom = "0.1.5"
 zerotrie = "0.2.1"
-tract-api = { version = "0.21.14-pre", path = 'api' }
-tract-core = { version = "0.21.14-pre", path = 'core' }
-tract-cuda = { version = "0.21.14-pre", path = 'cuda' }
-tract-data = { version = "0.21.14-pre", path = 'data' }
-tract-extra = { version = "0.21.14-pre", path = 'extra' }
-tract-gpu = { version = "0.21.14-pre", path = 'gpu' }
-tract-hir = { version = "0.21.14-pre", path = 'hir' }
-tract-libcli = { version = "0.21.14-pre", path = 'libcli' }
-tract-linalg = { version = "0.21.14-pre", path = 'linalg' }
-tract-metal = { version = "0.21.14-pre", path = 'metal' }
-tract-nnef-resources = { version = "0.21.14-pre", path = 'nnef/nnef-resources' }
-tract-nnef = { version = "0.21.14-pre", path = 'nnef' }
-tract-onnx-opl = { version = "0.21.14-pre", path = 'onnx-opl' }
-tract-onnx = { version = "0.21.14-pre", path = 'onnx' }
-tract-pulse-opl = { version = "0.21.14-pre", path = 'pulse-opl' }
-tract-pulse = { version = "0.21.14-pre", path = 'pulse' }
-tract-tensorflow = { version = "0.21.14-pre", path = 'tensorflow' }
-tract-tflite = { version = "0.21.14-pre", path = 'tflite' }
-tract-transformers = { version = "0.21.14-pre", path = 'transformers' }
-tract-rs = { version = "0.21.14-pre", path = 'api/rs' }
-tract-proxy = { version = "0.21.14-pre", path = 'api/proxy' }
-tract-proxy-sys = { version = "0.21.14-pre", path = 'api/proxy/sys' }
-tract-ffi = { version = "0.21.14-pre" }
-tract = { version = "0.21.14-pre" }
+tract-api = { version = "0.22.1-pre", path = 'api' }
+tract-core = { version = "0.22.1-pre", path = 'core' }
+tract-cuda = { version = "0.22.1-pre", path = 'cuda' }
+tract-data = { version = "0.22.1-pre", path = 'data' }
+tract-extra = { version = "0.22.1-pre", path = 'extra' }
+tract-gpu = { version = "0.22.1-pre", path = 'gpu' }
+tract-hir = { version = "0.22.1-pre", path = 'hir' }
+tract-libcli = { version = "0.22.1-pre", path = 'libcli' }
+tract-linalg = { version = "0.22.1-pre", path = 'linalg' }
+tract-metal = { version = "0.22.1-pre", path = 'metal' }
+tract-nnef-resources = { version = "0.22.1-pre", path = 'nnef/nnef-resources' }
+tract-nnef = { version = "0.22.1-pre", path = 'nnef' }
+tract-onnx-opl = { version = "0.22.1-pre", path = 'onnx-opl' }
+tract-onnx = { version = "0.22.1-pre", path = 'onnx' }
+tract-pulse-opl = { version = "0.22.1-pre", path = 'pulse-opl' }
+tract-pulse = { version = "0.22.1-pre", path = 'pulse' }
+tract-tensorflow = { version = "0.22.1-pre", path = 'tensorflow' }
+tract-tflite = { version = "0.22.1-pre", path = 'tflite' }
+tract-transformers = { version = "0.22.1-pre", path = 'transformers' }
+tract-rs = { version = "0.22.1-pre", path = 'api/rs' }
+tract-proxy = { version = "0.22.1-pre", path = 'api/proxy' }
+tract-proxy-sys = { version = "0.22.1-pre", path = 'api/proxy/sys' }
+tract-ffi = { version = "0.22.1-pre" }
+tract = { version = "0.22.1-pre" }
 
-[profile.dev]
-debug = 2
-strip = "none"
 
 [profile.opt-no-lto]
 inherits="release"
@@ -262,6 +255,18 @@ lto=false
 [profile.release]
 # debug = true
 lto = true
+opt-level = 3
 
 [profile.bench]
-inherits="release"
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.darling_macro]
+opt-level = 0 # work around never ending build on wondows
+
+[profile.dev.build-override]
+debug = false
+# strip = "debuginfo" does not work on android and ios
+incremental = false

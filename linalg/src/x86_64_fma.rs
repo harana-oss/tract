@@ -1,6 +1,11 @@
 use crate::Ops;
 use crate::frame::element_wise::ElementWiseKer;
 use crate::frame::reduce::{MapReduceKer, ReduceKer};
+#[cfg(target_arch = "x86_64")]
+use crate::x86_64_avx512::avx512_sigmoid_f32;
+#[cfg(target_arch = "x86_64")]
+use crate::x86_64_avx512::x86_64_avx512_softmax2_fastcompact_f32_64n;
+use crate::x86_64_fma::softmax::x86_64_fma_softmax2_fastcompact_f32_32n;
 
 pub mod mmm;
 
@@ -41,6 +46,8 @@ fn plug_avx512f(ops: &mut Ops) {
     ops.sum_f32 = Box::new(|| sum::x86_64_avx512_sum_f32_64n::red());
     ops.softmax2_fastcompact_f32 =
         Box::new(|| softmax::x86_64_avx512_softmax2_fastcompact_f32_64n::red());
+    ops.softmax2_fastcompact_f32 = Box::new(|| x86_64_avx512_softmax2_fastcompact_f32_64n::red());
+    ops.sigmoid_f32 = Box::new(|| avx512_sigmoid_f32::ew());
 }
 
 pub fn plug(ops: &mut Ops) {

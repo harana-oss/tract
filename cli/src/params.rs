@@ -54,7 +54,11 @@ impl Location {
     }
 
     fn is_dir(&self) -> bool {
-        if let &Location::Fs(p) = &self { p.is_dir() } else { false }
+        if let &Location::Fs(p) = &self {
+            p.is_dir()
+        } else {
+            false
+        }
     }
 
     fn read(&self) -> TractResult<Box<dyn Read>> {
@@ -297,13 +301,10 @@ impl Parameters {
             }
             #[cfg(feature = "onnx")]
             "onnx" => {
-                let mut onnx = tract_onnx::onnx();
-                if matches.is_present("onnx-ignore-output-shapes") {
-                    onnx = onnx.with_ignore_output_shapes(true);
-                }
-                if matches.is_present("onnx-ignore-output-types") {
-                    onnx = onnx.with_ignore_output_types(true);
-                }
+                let onnx = tract_onnx::onnx()
+                    .with_ignore_output_shapes(matches.is_present("onnx-ignore-output-shapes"))
+                    .with_ignore_output_types(matches.is_present("onnx-ignore-output-types"))
+                    .with_ignore_value_info(matches.is_present("onnx-ignore-value-info"));
                 info_usage("loaded framework (onnx)", probe);
                 let graph = onnx.proto_model_for_read(&mut *location.read()?)?;
                 info_usage("proto model loaded", probe);
@@ -1021,7 +1022,7 @@ impl Parameters {
             .collect();
 
         let assertions = match matches.subcommand() {
-            Some(("dump" | "run", sm)) => Assertions::from_clap(sm, &symbols)?,
+            Some(("dump" | "run" | "compare", sm)) => Assertions::from_clap(sm, &symbols)?,
             _ => Assertions::default(),
         };
 
@@ -1152,6 +1153,7 @@ pub struct Assertions {
     pub assert_op_count: Option<Vec<(String, usize)>>,
     pub approximation: Approximation,
     pub allow_missing_outputs: bool,
+    pub assert_llm_lev20: Option<usize>,
 }
 
 impl Assertions {
@@ -1178,19 +1180,21 @@ impl Assertions {
             match sub.value_of("approx").unwrap() {
                 "exact" => Approximation::Exact,
                 "close" => Approximation::Close,
-                "approximate" => Approximation::Approximate,
+                "approx" | "approximate" => Approximation::Approximate,
                 "very" => Approximation::VeryApproximate,
                 "super" => Approximation::SuperApproximate,
                 "ultra" => Approximation::UltraApproximate,
                 _ => panic!(),
             }
         };
+        let assert_llm_lev20 = sub.value_of("assert-llm-lev20").map(|v| v.parse()).transpose()?;
         Ok(Assertions {
             assert_outputs,
             assert_output_facts,
             assert_op_count,
             approximation,
             allow_missing_outputs,
+            assert_llm_lev20,
         })
     }
 }

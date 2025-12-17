@@ -1,13 +1,17 @@
-// SIMD normalizer with NEON on aarch64 and AVX2 on x86_64, plus scalar fallback
 #![allow(unsafe_op_in_unsafe_fn)]
+
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
 
-const SMALL_FAST_C: usize = 128;
+#[cfg(target_arch = "aarch64")]
+use std::arch::aarch64::*;
+
+#[cfg(target_arch = "aarch64")]
+const NEON_SMALL_FAST_C: usize = 128;
 
 pub fn register(registry: &mut Registry) {
     registry.register_primitive(
-        "tract_onnx_ml_normalizer",
+        "Normalizer",
         &parameters(),
         &[("output", TypeName::Scalar.tensor())],
         load,
@@ -39,6 +43,8 @@ pub struct Normalizer {
 impl Normalizer {
     pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
         let rank = input.ndim();
+        ensure!(rank >= 1, "Normalizer expects rank 1 or 2 inputs");
+
         let shape = input.shape();
         let c = shape[rank - 1];
         let outer = shape[..rank - 1].iter().product::<usize>();
@@ -48,96 +54,32 @@ impl Normalizer {
 
         let mut output = vec![0.0f32; input_slice.len()];
 
-        unsafe {
-            self.eval_arch(input_slice, &mut output, outer, c);
-        }
-
-        Tensor::from_shape(shape, &output)
-    }
-
-    /// Slice-based normalization that reuses the same NEON/scalar paths as `eval`,
-    /// without constructing ndarray views. `outer` is the product of leading dims,
-    /// and `c` is the size of the last dimension.
-    pub fn eval_into_slices(
-        &self,
-        input: &[f32],
-        output: &mut [f32],
-        outer: usize,
-        c: usize,
-    ) -> TractResult<()> {
-        ensure!(input.len() == output.len());
-        ensure!(input.len() == outer * c);
-        unsafe {
-            self.eval_arch(input, output, outer, c);
-        }
-        Ok(())
-    }
-
-    /// In-place variant: normalize rows directly in the provided buffer.
-    /// The buffer must be shaped as (outer, c) in row-major order.
-    pub fn eval_inplace_rows(&self, data: &mut [f32], outer: usize, c: usize) -> TractResult<()> {
-        ensure!(data.len() == outer * c);
-        unsafe {
-            // Create a temporary immutable alias to the same memory to satisfy the API
-            let input_alias = std::slice::from_raw_parts(data.as_ptr(), data.len());
-            self.eval_arch(input_alias, data, outer, c);
-        }
-        Ok(())
-    }
-
-    // Architecture-dispatched SIMD core
-    #[inline(always)]
-    unsafe fn eval_arch(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
         #[cfg(target_arch = "aarch64")]
-        {
-            self.eval_neon(input, output, outer, c)
+        unsafe {
+            self.eval_neon(input_slice, &mut output, outer, c);
         }
-        #[cfg(target_arch = "x86_64")]
+
+        #[cfg(not(target_arch = "aarch64"))]
         {
-            self.eval_x86(input, output, outer, c)
+            self.eval_scalar(input_slice, &mut output, outer, c);
         }
-        #[cfg(all(not(target_arch = "aarch64"), not(target_arch = "x86_64")))]
-        {
-            self.eval_scalar(input, output, outer, c)
-        }
+
+        let output_arr = ArrayD::from_shape_vec(shape.to_vec(), output)?;
+        Ok(output_arr.into_tensor())
     }
 
-    // Scalar fallback used on unsupported arches or when AVX2 unavailable
-    #[inline(always)]
-    unsafe fn eval_scalar(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
-        const EPS: f32 = 1e-12;
-        for i in 0..outer {
-            let offset = i * c;
-            let row = &input[offset..offset + c];
-            let out_row = &mut output[offset..offset + c];
-
-            let norm = match self.kind {
-                NormKind::Max => row.iter().copied().map(f32::abs).fold(0.0, f32::max),
-                NormKind::L1 => row.iter().copied().map(f32::abs).sum::<f32>(),
-                NormKind::L2 => row.iter().copied().map(|v| v * v).sum::<f32>(),
-            };
-
-            let scale = match self.kind {
-                NormKind::L2 => 1.0 / norm.max(EPS).sqrt(),
-                _ => 1.0 / norm.max(EPS),
-            };
-            for j in 0..c {
-                out_row[j] = row[j] * scale;
-            }
-        }
-    }
-
-    // aarch64 NEON implementation (existing)
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn eval_neon(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
         const EPS: f32 = 1e-12;
+        const NEON_SMALL_FAST_C: usize = 128;
 
         for i in 0..outer {
             let offset = i * c;
             let row = &input[offset..offset + c];
             let out_row = &mut output[offset..offset + c];
 
-            if c <= SMALL_FAST_C {
+            if c <= NEON_SMALL_FAST_C {
                 match self.kind {
                     NormKind::Max => unsafe { self.normalize_small_max_neon(row, out_row) },
                     NormKind::L1 => unsafe { self.normalize_small_l1_neon(row, out_row) },
@@ -167,314 +109,14 @@ impl Normalizer {
         }
     }
 
-    // x86_64 AVX2 entrypoint with runtime detection
-    #[cfg(target_arch = "x86_64")]
-    unsafe fn eval_x86(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
-        if std::is_x86_feature_detected!("avx2") {
-            self.eval_avx2(input, output, outer, c)
-        } else {
-            self.eval_scalar(input, output, outer, c)
-        }
-    }
-
-    // x86_64 AVX2 implementation
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn eval_avx2(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
-        const EPS: f32 = 1e-12;
-        for i in 0..outer {
-            let offset = i * c;
-            let row = &input[offset..offset + c];
-            let out_row = &mut output[offset..offset + c];
-
-            // For simplicity and maintainability, do a two-pass SIMD approach for small sizes too
-            let norm = match self.kind {
-                NormKind::Max => self.compute_max_norm_avx2(row),
-                NormKind::L1 => self.compute_l1_norm_avx2(row),
-                NormKind::L2 => self.compute_l2_norm_avx2(row),
-            };
-
-            let scale = match self.kind {
-                NormKind::L2 => 1.0 / norm.max(EPS).sqrt(),
-                _ => 1.0 / norm.max(EPS),
-            };
-
-            self.scale_avx2(row, out_row, scale);
-        }
-    }
-
-    // ===== Arch-specific helpers =====
-
-    // x86_64 AVX2 helpers
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn compute_max_norm_avx2(&self, slice: &[f32]) -> f32 {
-        use std::arch::x86_64::*;
-        let len = slice.len();
-        let mut i = 0usize;
-
-        // Use 4-way unrolling for better ILP (instruction-level parallelism)
-        let mut vmax0 = _mm256_set1_ps(f32::MIN);
-        let mut vmax1 = _mm256_set1_ps(f32::MIN);
-        let mut vmax2 = _mm256_set1_ps(f32::MIN);
-        let mut vmax3 = _mm256_set1_ps(f32::MIN);
-        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffffu32 as i32));
-
-        // Process 32 elements at a time (4 vectors of 8)
-        while i + 32 <= len {
-            let v0 = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
-            let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
-            let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-
-            let vabs0 = _mm256_and_ps(v0, abs_mask);
-            let vabs1 = _mm256_and_ps(v1, abs_mask);
-            let vabs2 = _mm256_and_ps(v2, abs_mask);
-            let vabs3 = _mm256_and_ps(v3, abs_mask);
-
-            vmax0 = _mm256_max_ps(vmax0, vabs0);
-            vmax1 = _mm256_max_ps(vmax1, vabs1);
-            vmax2 = _mm256_max_ps(vmax2, vabs2);
-            vmax3 = _mm256_max_ps(vmax3, vabs3);
-            i += 32;
-        }
-
-        // Reduce the 4 accumulators
-        vmax0 = _mm256_max_ps(vmax0, vmax1);
-        vmax2 = _mm256_max_ps(vmax2, vmax3);
-        vmax0 = _mm256_max_ps(vmax0, vmax2);
-
-        // Process remaining 8-element chunks
-        while i + 8 <= len {
-            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let vabs = _mm256_and_ps(v, abs_mask);
-            vmax0 = _mm256_max_ps(vmax0, vabs);
-            i += 8;
-        }
-
-        let mut max_val = hmax256_ps(vmax0);
-
-        // Scalar tail
-        while i < len {
-            max_val = max_val.max((*slice.get_unchecked(i)).abs());
-            i += 1;
-        }
-        max_val
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn compute_l1_norm_avx2(&self, slice: &[f32]) -> f32 {
-        use std::arch::x86_64::*;
-        let len = slice.len();
-        let mut i = 0usize;
-
-        // Use 4-way unrolling for better ILP
-        let mut vsum0 = _mm256_setzero_ps();
-        let mut vsum1 = _mm256_setzero_ps();
-        let mut vsum2 = _mm256_setzero_ps();
-        let mut vsum3 = _mm256_setzero_ps();
-        let abs_mask = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffffu32 as i32));
-
-        // Process 32 elements at a time (4 vectors of 8)
-        while i + 32 <= len {
-            let v0 = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
-            let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
-            let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-
-            let vabs0 = _mm256_and_ps(v0, abs_mask);
-            let vabs1 = _mm256_and_ps(v1, abs_mask);
-            let vabs2 = _mm256_and_ps(v2, abs_mask);
-            let vabs3 = _mm256_and_ps(v3, abs_mask);
-
-            vsum0 = _mm256_add_ps(vsum0, vabs0);
-            vsum1 = _mm256_add_ps(vsum1, vabs1);
-            vsum2 = _mm256_add_ps(vsum2, vabs2);
-            vsum3 = _mm256_add_ps(vsum3, vabs3);
-            i += 32;
-        }
-
-        // Reduce the 4 accumulators
-        vsum0 = _mm256_add_ps(vsum0, vsum1);
-        vsum2 = _mm256_add_ps(vsum2, vsum3);
-        vsum0 = _mm256_add_ps(vsum0, vsum2);
-
-        // Process remaining 8-element chunks
-        while i + 8 <= len {
-            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let vabs = _mm256_and_ps(v, abs_mask);
-            vsum0 = _mm256_add_ps(vsum0, vabs);
-            i += 8;
-        }
-
-        let mut sum = hsum256_ps(vsum0);
-
-        // Scalar tail
-        while i < len {
-            sum += (*slice.get_unchecked(i)).abs();
-            i += 1;
-        }
-        sum
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn compute_l2_norm_avx2(&self, slice: &[f32]) -> f32 {
-        use std::arch::x86_64::*;
-        if std::is_x86_feature_detected!("fma") {
-            return self.compute_l2_norm_avx2_fma(slice);
-        }
-        let len = slice.len();
-        let mut i = 0usize;
-
-        // Use 4-way unrolling for better ILP
-        let mut vsum0 = _mm256_setzero_ps();
-        let mut vsum1 = _mm256_setzero_ps();
-        let mut vsum2 = _mm256_setzero_ps();
-        let mut vsum3 = _mm256_setzero_ps();
-
-        // Process 32 elements at a time (4 vectors of 8)
-        while i + 32 <= len {
-            let v0 = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
-            let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
-            let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-
-            let sq0 = _mm256_mul_ps(v0, v0);
-            let sq1 = _mm256_mul_ps(v1, v1);
-            let sq2 = _mm256_mul_ps(v2, v2);
-            let sq3 = _mm256_mul_ps(v3, v3);
-
-            vsum0 = _mm256_add_ps(vsum0, sq0);
-            vsum1 = _mm256_add_ps(vsum1, sq1);
-            vsum2 = _mm256_add_ps(vsum2, sq2);
-            vsum3 = _mm256_add_ps(vsum3, sq3);
-            i += 32;
-        }
-
-        // Reduce the 4 accumulators
-        vsum0 = _mm256_add_ps(vsum0, vsum1);
-        vsum2 = _mm256_add_ps(vsum2, vsum3);
-        vsum0 = _mm256_add_ps(vsum0, vsum2);
-
-        // Process remaining 8-element chunks
-        while i + 8 <= len {
-            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let sq = _mm256_mul_ps(v, v);
-            vsum0 = _mm256_add_ps(vsum0, sq);
-            i += 8;
-        }
-
-        let mut sum = hsum256_ps(vsum0);
-
-        // Scalar tail
-        while i < len {
-            let v = *slice.get_unchecked(i);
-            sum += v * v;
-            i += 1;
-        }
-        sum
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2,fma")]
-    unsafe fn compute_l2_norm_avx2_fma(&self, slice: &[f32]) -> f32 {
-        use std::arch::x86_64::*;
-        let len = slice.len();
-        let mut i = 0usize;
-
-        // Use 4-way unrolling for better ILP with FMA
-        let mut vsum0 = _mm256_setzero_ps();
-        let mut vsum1 = _mm256_setzero_ps();
-        let mut vsum2 = _mm256_setzero_ps();
-        let mut vsum3 = _mm256_setzero_ps();
-
-        // Process 32 elements at a time (4 vectors of 8)
-        while i + 32 <= len {
-            let v0 = _mm256_loadu_ps(slice.as_ptr().add(i));
-            let v1 = _mm256_loadu_ps(slice.as_ptr().add(i + 8));
-            let v2 = _mm256_loadu_ps(slice.as_ptr().add(i + 16));
-            let v3 = _mm256_loadu_ps(slice.as_ptr().add(i + 24));
-
-            vsum0 = _mm256_fmadd_ps(v0, v0, vsum0);
-            vsum1 = _mm256_fmadd_ps(v1, v1, vsum1);
-            vsum2 = _mm256_fmadd_ps(v2, v2, vsum2);
-            vsum3 = _mm256_fmadd_ps(v3, v3, vsum3);
-            i += 32;
-        }
-
-        // Reduce the 4 accumulators
-        vsum0 = _mm256_add_ps(vsum0, vsum1);
-        vsum2 = _mm256_add_ps(vsum2, vsum3);
-        vsum0 = _mm256_add_ps(vsum0, vsum2);
-
-        // Process remaining 8-element chunks
-        while i + 8 <= len {
-            let v = _mm256_loadu_ps(slice.as_ptr().add(i));
-            vsum0 = _mm256_fmadd_ps(v, v, vsum0);
-            i += 8;
-        }
-
-        let mut sum = hsum256_ps(vsum0);
-
-        // Scalar tail
-        while i < len {
-            let v = *slice.get_unchecked(i);
-            sum += v * v;
-            i += 1;
-        }
-        sum
-    }
-
-    #[cfg(target_arch = "x86_64")]
-    #[target_feature(enable = "avx2")]
-    unsafe fn scale_avx2(&self, input: &[f32], output: &mut [f32], scale: f32) {
-        use std::arch::x86_64::*;
-        let len = input.len();
-        let mut i = 0usize;
-        let s = _mm256_set1_ps(scale);
-
-        // Process 32 elements at a time (4 vectors of 8) for better throughput
-        while i + 32 <= len {
-            let v0 = _mm256_loadu_ps(input.as_ptr().add(i));
-            let v1 = _mm256_loadu_ps(input.as_ptr().add(i + 8));
-            let v2 = _mm256_loadu_ps(input.as_ptr().add(i + 16));
-            let v3 = _mm256_loadu_ps(input.as_ptr().add(i + 24));
-
-            let r0 = _mm256_mul_ps(v0, s);
-            let r1 = _mm256_mul_ps(v1, s);
-            let r2 = _mm256_mul_ps(v2, s);
-            let r3 = _mm256_mul_ps(v3, s);
-
-            _mm256_storeu_ps(output.as_mut_ptr().add(i), r0);
-            _mm256_storeu_ps(output.as_mut_ptr().add(i + 8), r1);
-            _mm256_storeu_ps(output.as_mut_ptr().add(i + 16), r2);
-            _mm256_storeu_ps(output.as_mut_ptr().add(i + 24), r3);
-            i += 32;
-        }
-
-        // Process remaining 8-element chunks
-        while i + 8 <= len {
-            let v = _mm256_loadu_ps(input.as_ptr().add(i));
-            let r = _mm256_mul_ps(v, s);
-            _mm256_storeu_ps(output.as_mut_ptr().add(i), r);
-            i += 8;
-        }
-
-        // Scalar tail
-        while i < len {
-            *output.get_unchecked_mut(i) = *input.get_unchecked(i) * scale;
-            i += 1;
-        }
-    }
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn normalize_small_max_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
         let mut i = 0;
 
-        const MAX_CHUNKS: usize = SMALL_FAST_C / 16;
+        const MAX_CHUNKS: usize = NEON_SMALL_FAST_C / 16;
         let mut stored: [float32x4x4_t; MAX_CHUNKS] =
             [float32x4x4_t(vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
                 MAX_CHUNKS];
@@ -509,15 +151,20 @@ impl Normalizer {
         max_vec0 = vmaxq_f32(max_vec0, max_vec2);
         let mut max = horizontal_max_f32x4(max_vec0);
 
-        // Process remaining elements with 4-wide SIMD (accumulate only)
+        // Handle remaining elements with 4-wide SIMD
         if i + 4 <= len {
             let v = vld1q_f32(row.as_ptr().add(i));
             let abs_v = vabsq_f32(v);
             max = max.max(horizontal_max_f32x4(abs_v));
+
+            let scale = 1.0 / max.max(EPS);
+            let scale_vec = vdupq_n_f32(scale);
+            let scaled = vmulq_f32(v, scale_vec);
+            vst1q_f32(out_row.as_mut_ptr().add(i), scaled);
             i += 4;
         }
 
-        // Scalar tail (accumulate only)
+        // Scalar tail
         while i < len {
             max = max.max(row[i].abs());
             i += 1;
@@ -539,27 +186,20 @@ impl Normalizer {
             );
         }
 
-        // Write remainder after final scale
-        let mut j = chunk_count * 16;
-        while j + 4 <= len {
-            let v = vld1q_f32(row.as_ptr().add(j));
-            let scaled = vmulq_f32(v, scale_vec);
-            vst1q_f32(out_row.as_mut_ptr().add(j), scaled);
-            j += 4;
-        }
-        while j < len {
-            out_row[j] = row[j] * scale;
-            j += 1;
+        let base = chunk_count * 16 + ((len - chunk_count * 16) & !3);
+        for t in base..len {
+            out_row[t] = row[t] * scale;
         }
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn normalize_small_l1_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
         let mut i = 0;
 
-        const MAX_CHUNKS: usize = SMALL_FAST_C / 16;
+        const MAX_CHUNKS: usize = NEON_SMALL_FAST_C / 16;
         let mut stored: [float32x4x4_t; MAX_CHUNKS] =
             [float32x4x4_t(vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
                 MAX_CHUNKS];
@@ -594,15 +234,20 @@ impl Normalizer {
         sum_vec0 = vaddq_f32(sum_vec0, sum_vec2);
         let mut sum = horizontal_sum_f32x4(sum_vec0);
 
-        // Process remaining elements with 4-wide SIMD (accumulate only)
+        // Handle remaining elements with 4-wide SIMD
         if i + 4 <= len {
             let v = vld1q_f32(row.as_ptr().add(i));
             let abs_v = vabsq_f32(v);
             sum += horizontal_sum_f32x4(abs_v);
+
+            let scale = 1.0 / sum.max(EPS);
+            let scale_vec = vdupq_n_f32(scale);
+            let scaled = vmulq_f32(v, scale_vec);
+            vst1q_f32(out_row.as_mut_ptr().add(i), scaled);
             i += 4;
         }
 
-        // Scalar tail (accumulate only)
+        // Scalar tail
         while i < len {
             sum += row[i].abs();
             i += 1;
@@ -624,27 +269,20 @@ impl Normalizer {
             );
         }
 
-        // Write remainder after final scale
-        let mut j = chunk_count * 16;
-        while j + 4 <= len {
-            let v = vld1q_f32(row.as_ptr().add(j));
-            let scaled = vmulq_f32(v, scale_vec);
-            vst1q_f32(out_row.as_mut_ptr().add(j), scaled);
-            j += 4;
-        }
-        while j < len {
-            out_row[j] = row[j] * scale;
-            j += 1;
+        let base = chunk_count * 16 + ((len - chunk_count * 16) & !3);
+        for t in base..len {
+            out_row[t] = row[t] * scale;
         }
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn normalize_small_l2_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
         let mut i = 0;
 
-        const MAX_CHUNKS: usize = SMALL_FAST_C / 16;
+        const MAX_CHUNKS: usize = NEON_SMALL_FAST_C / 16;
         let mut stored: [float32x4x4_t; MAX_CHUNKS] =
             [float32x4x4_t(vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0), vdupq_n_f32(0.0));
                 MAX_CHUNKS];
@@ -676,16 +314,21 @@ impl Normalizer {
         sum_vec0 = vaddq_f32(sum_vec0, sum_vec2);
         let mut sum = horizontal_sum_f32x4(sum_vec0);
 
-        // Process remaining elements with 4-wide SIMD (accumulate only)
+        // Handle remaining elements with 4-wide SIMD
         if i + 4 <= len {
             let v = vld1q_f32(row.as_ptr().add(i));
             let mut accum = vdupq_n_f32(0.0);
             accum = vfmaq_f32(accum, v, v);
             sum += horizontal_sum_f32x4(accum);
+
+            let scale = self.reciprocal_sqrt_neon(sum.max(EPS));
+            let scale_vec = vdupq_n_f32(scale);
+            let scaled = vmulq_f32(v, scale_vec);
+            vst1q_f32(out_row.as_mut_ptr().add(i), scaled);
             i += 4;
         }
 
-        // Scalar tail (accumulate only)
+        // Scalar tail
         while i < len {
             let val = row[i];
             sum += val * val;
@@ -708,21 +351,14 @@ impl Normalizer {
             );
         }
 
-        // Write remainder after final scale
-        let mut j = chunk_count * 16;
-        while j + 4 <= len {
-            let v = vld1q_f32(row.as_ptr().add(j));
-            let scaled = vmulq_f32(v, scale_vec);
-            vst1q_f32(out_row.as_mut_ptr().add(j), scaled);
-            j += 4;
-        }
-        while j < len {
-            out_row[j] = row[j] * scale;
-            j += 1;
+        let base = chunk_count * 16 + ((len - chunk_count * 16) & !3);
+        for t in base..len {
+            out_row[t] = row[t] * scale;
         }
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn reciprocal_sqrt_neon(&self, x: f32) -> f32 {
         let v = vdupq_n_f32(x);
         let estimate = vrsqrteq_f32(v);
@@ -736,6 +372,7 @@ impl Normalizer {
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn compute_max_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -785,6 +422,7 @@ impl Normalizer {
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn compute_l1_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -834,6 +472,7 @@ impl Normalizer {
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn compute_l2_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -880,6 +519,7 @@ impl Normalizer {
     }
 
     #[cfg(target_arch = "aarch64")]
+    #[target_feature(enable = "neon")]
     unsafe fn scale_neon(&self, input: &[f32], output: &mut [f32], scale: f32) {
         let scale_vec = vdupq_n_f32(scale);
         let len = input.len();
@@ -914,14 +554,34 @@ impl Normalizer {
         }
     }
 
-    // Scalar fallbacks removed for NEON-only section; a generic scalar exists above
+    fn eval_scalar(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
+        const EPS: f32 = 1e-12;
+
+        for i in 0..outer {
+            let offset = i * c;
+            let row = &input[offset..offset + c];
+            let out_row = &mut output[offset..offset + c];
+
+            let norm = match self.kind {
+                NormKind::Max => row.iter().map(|x| x.abs()).fold(f32::MIN, f32::max),
+                NormKind::L1 => row.iter().map(|x| x.abs()).sum::<f32>(),
+                NormKind::L2 => row.iter().map(|x| x * x).sum::<f32>(),
+            };
+
+            let scale = match self.kind {
+                NormKind::L2 => 1.0 / norm.max(EPS).sqrt(),
+                _ => 1.0 / norm.max(EPS),
+            };
+
+            for (o, &val) in out_row.iter_mut().zip(row.iter()) {
+                *o = val * scale;
+            }
+        }
+    }
 }
 
-// aarch64 helpers
 #[cfg(target_arch = "aarch64")]
-use std::arch::aarch64::*;
-
-#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn horizontal_sum_f32x4(v: float32x4_t) -> f32 {
     let pair_sum = vpaddq_f32(v, v);
     let final_sum = vpaddq_f32(pair_sum, pair_sum);
@@ -929,39 +589,11 @@ unsafe fn horizontal_sum_f32x4(v: float32x4_t) -> f32 {
 }
 
 #[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
 unsafe fn horizontal_max_f32x4(v: float32x4_t) -> f32 {
     let pair_max = vpmaxq_f32(v, v);
     let final_max = vpmaxq_f32(pair_max, pair_max);
     vgetq_lane_f32(final_max, 0)
-}
-
-// x86_64 helpers
-#[cfg(target_arch = "x86_64")]
-use std::arch::x86_64::*;
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn hsum256_ps(v: __m256) -> f32 {
-    // Efficient horizontal sum using hadd and extract
-    // v = [a0, a1, a2, a3, a4, a5, a6, a7]
-    let hi = _mm256_extractf128_ps(v, 1); // [a4, a5, a6, a7]
-    let lo = _mm256_castps256_ps128(v); // [a0, a1, a2, a3]
-    let sum_128 = _mm_add_ps(lo, hi); // [a0+a4, a1+a5, a2+a6, a3+a7]
-    let sum_64 = _mm_add_ps(sum_128, _mm_movehl_ps(sum_128, sum_128)); // [a0+a4+a2+a6, ...]
-    let sum_32 = _mm_add_ss(sum_64, _mm_shuffle_ps(sum_64, sum_64, 0x01));
-    _mm_cvtss_f32(sum_32)
-}
-
-#[cfg(target_arch = "x86_64")]
-#[target_feature(enable = "avx2")]
-unsafe fn hmax256_ps(v: __m256) -> f32 {
-    // Efficient horizontal max using extract and max
-    let hi = _mm256_extractf128_ps(v, 1);
-    let lo = _mm256_castps256_ps128(v);
-    let max_128 = _mm_max_ps(lo, hi);
-    let max_64 = _mm_max_ps(max_128, _mm_movehl_ps(max_128, max_128));
-    let max_32 = _mm_max_ss(max_64, _mm_shuffle_ps(max_64, max_64, 0x01));
-    _mm_cvtss_f32(max_32)
 }
 
 impl Op for Normalizer {

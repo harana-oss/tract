@@ -1,16 +1,16 @@
 //! `Tensor`, tract main data object of interest.
-use crate::TVec;
 use crate::blob::Blob;
-use crate::datum::{ClampCast, Datum, DatumType, QParams, round_ties_to_even, scale_by};
+use crate::datum::{round_ties_to_even, scale_by, ClampCast, Datum, DatumType, QParams};
 use crate::dim::TDim;
 use crate::internal::*;
 use crate::opaque::Opaque;
+use crate::TVec;
 use half::f16;
-use itertools::{Itertools, izip};
+use itertools::{izip, Itertools};
 use ndarray::prelude::*;
 #[cfg(feature = "complex")]
 use num_complex::Complex;
-use num_traits::Float;
+use num_traits::{Float, Zero};
 use std::borrow::Cow;
 use std::fmt;
 use std::hash::Hash;
@@ -47,7 +47,11 @@ impl Eq for Approximation {}
 
 impl From<bool> for Approximation {
     fn from(b: bool) -> Self {
-        if b { Self::Approximate } else { Self::Exact }
+        if b {
+            Self::Approximate
+        } else {
+            Self::Exact
+        }
     }
 }
 
@@ -196,29 +200,26 @@ impl Tensor {
         shape: &[usize],
         alignment: usize,
     ) -> TractResult<Tensor> {
-        let len = shape.iter().product::<usize>();
-        let bytes = len * dt.size_of();
+        let bytes = shape.iter().cloned().product::<usize>() * dt.size_of();
         let data = unsafe { Blob::new_for_size_and_align(bytes, alignment) };
         let mut tensor = Tensor { strides: tvec!(), dt, shape: shape.into(), data, len: 0 };
-
         if tensor.shape.len() == 0 {
             tensor.len = 1;
         } else {
             tensor.update_strides_and_len();
         }
-
-        if bytes > 0 {
+        if !tensor.data.is_empty() {
             if dt == String::datum_type() || dt == Blob::datum_type() {
-                unsafe {
-                    std::ptr::write_bytes(tensor.data.as_mut_ptr(), 0, bytes);
-                }
+                // assumes zero-initialized string and blob are valid
+                tensor.data.fill(0);
             } else if dt == TDim::datum_type() {
-                // Assuming TDim::zero() is bitwise zero, batch initialize
                 unsafe {
-                    std::ptr::write_bytes(tensor.as_ptr_mut_unchecked::<TDim>(), 0, len);
+                    tensor
+                        .as_slice_mut_unchecked::<TDim>()
+                        .iter_mut()
+                        .for_each(|dim| std::ptr::write(dim, TDim::zero()))
                 }
             } else if dt == Opaque::datum_type() {
-                // If Opaque::default() is NOT bitwise zero, keep loop
                 unsafe {
                     tensor.as_slice_mut_unchecked::<Opaque>().iter_mut().for_each(|p| {
                         std::ptr::write(p, Opaque::default());
@@ -229,13 +230,11 @@ impl Tensor {
                 if dt == DatumType::F32 {
                     tensor.fill_t(f32::NAN).unwrap();
                 } else {
-                    unsafe {
-                        std::ptr::write_bytes(tensor.as_bytes_mut().as_mut_ptr(), 0xFF, bytes);
-                    }
+                    // safe, non copy types have been dealt with
+                    tensor.as_bytes_mut().iter_mut().for_each(|x| *x = (-1i8) as u8);
                 }
             }
         }
-
         Ok(tensor)
     }
 

@@ -54,10 +54,20 @@ pub fn check_outputs(got: &[Vec<TValue>], params: &Parameters) -> TractResult<()
         {
             exp = exp.cast_to_dt(got.datum_type())?.into_owned().into_tvalue();
         }
-        if let Err(e) = exp
-            .close_enough(&got, params.assertions.approximation)
-            .context(format!("Checking output {ix}"))
-        {
+        let result: TractResult<()> = if let Some(limit) = params.assertions.assert_llm_lev20 {
+            let lev = crate::llm::top_logits_levenshtein(&exp, &got, 20)?;
+            info!("Levenshtein distance on first 20 logits: lev20={lev}");
+            if lev <= limit {
+                Ok(())
+            } else {
+                TractResult::Err(anyhow!(
+                    "Levenshtein criteria on first 20 not met found lev20={lev}, expected {limit}"
+                ))
+            }
+        } else {
+            exp.close_enough(&got, params.assertions.approximation)
+        };
+        if let Err(e) = result.context(format!("Checking output {ix}")) {
             if error.is_some() {
                 error!("{e:?}");
             } else {
@@ -68,7 +78,11 @@ pub fn check_outputs(got: &[Vec<TValue>], params: &Parameters) -> TractResult<()
         }
     }
 
-    if let Some(e) = error { Err(e) } else { Ok(()) }
+    if let Some(e) = error {
+        Err(e)
+    } else {
+        Ok(())
+    }
 }
 
 /// Compares the outputs of a node in tract and tensorflow.
@@ -89,18 +103,17 @@ pub fn check_inferred(got: &[InferenceFact], expected: &[InferenceFact]) -> Trac
     Ok(())
 }
 
+pub fn clarify_tvalue(t: &TValue) -> TractResult<TValue> {
+    if t.datum_type().is_opaque() && t.volume() == 1 {
+        if let Some(clarified) = t.to_scalar::<Opaque>()?.clarify_to_tensor()? {
+            return Ok(clarified.into_tvalue());
+        }
+    }
+    Ok((*t).clone())
+}
+
 pub fn clarify_tvalues(values: &TVec<TValue>) -> TractResult<TVec<TValue>> {
-    values
-        .iter()
-        .map(|t| {
-            if t.datum_type().is_opaque() && t.volume() == 1 {
-                if let Some(clarified) = t.to_scalar::<Opaque>()?.clarify_to_tensor()? {
-                    return Ok(clarified.into_tvalue());
-                }
-            }
-            Ok(t.clone())
-        })
-        .collect()
+    values.iter().map(clarify_tvalue).collect()
 }
 
 pub fn clarify_typed_fact<'a>(fact: impl Into<Cow<'a, TypedFact>>) -> Cow<'a, TypedFact> {

@@ -9,6 +9,10 @@ use crate::mmm::{EagerPackedInput, MMMInputFormat, MMMInputValue, PackedOpaqueFa
 
 use crate::WeightType;
 
+// AVX-512 optimized pack fast-paths and helpers
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
 #[derive(Clone, Eq, PartialEq, Hash)]
 pub struct PackedFormat {
     pub dt: DatumType,
@@ -409,6 +413,7 @@ pub trait PackingWriter<T: Copy> {
 }
 
 #[derive(Debug)]
+#[cfg_attr(target_arch = "x86_64", repr(align(64)))]
 pub struct KOutSinglePanelWriter<'p, T>
 where
     T: Copy + std::fmt::Debug,
@@ -440,6 +445,7 @@ where
 }
 
 #[derive(Debug)]
+#[cfg_attr(target_arch = "x86_64", repr(align(64)))]
 pub struct KOutWriter<'p, T>
 where
     T: Copy + std::fmt::Debug,
@@ -512,6 +518,7 @@ where
 }
 
 #[derive(Debug)]
+#[cfg_attr(target_arch = "x86_64", repr(align(64)))]
 pub struct KInWriter<'p, T>
 where
     T: Copy + Debug,
@@ -601,12 +608,35 @@ unsafe fn pack_mn_major<Chunk: Copy>(
         let mnr = std::mem::size_of::<Chunk>();
         let full_panes = mn_range_bytes.len() / mnr;
         let partial_pane = mn_range_bytes.len() % mnr;
+
+        // Heuristics for enabling software prefetching and non-temporal stores
+        // Non-temporal stores can reduce cache pollution when each row write is large
+        // and unlikely to be reused soon. Keep conservative thresholds.
+        const NT_MIN_BYTES_PER_ROW: usize = 64 * 1024; // 64KB writes before enabling NT
+        const PREFETCH_DISTANCE_BYTES: isize = 2 * 64 * 16; // 2KB lookahead
+
+        // Try AVX-512 fast-path for 64-byte chunks only (common rbytes cases: 64)
+        #[cfg(target_arch = "x86_64")]
+        if mnr == 64 && is_x86_feature_detected!("avx512f") && full_panes > 0 {
+            // SAFETY: guarded by runtime feature check; function itself also enables feature
+            return avx512_pack_mn_major_64(
+                b,
+                packed,
+                panel_len,
+                k_stride_bytes,
+                mn_range_bytes,
+                k_range,
+                partial_pane,
+            );
+        }
+
         for k in 0..k_range.len() {
             let mut p_row = packed.add(k * mnr);
             let mut b_row = b.offset(
                 (k_range.start + k) as isize * k_stride_bytes + mn_range_bytes.start as isize,
             );
             for _ in 0..full_panes {
+                // For generic path, fall back to memcpy for portability
                 p_row.copy_from_nonoverlapping(b_row, mnr);
                 p_row = p_row.add(panel_len);
                 b_row = b_row.add(mnr);
@@ -614,6 +644,49 @@ unsafe fn pack_mn_major<Chunk: Copy>(
             if partial_pane > 0 {
                 p_row.copy_from_nonoverlapping(b_row, partial_pane);
             }
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn avx512_pack_mn_major_64(
+    b: *const u8,
+    packed: *mut u8,
+    panel_len: usize,
+    k_stride_bytes: isize,
+    mn_range_bytes: Range<usize>,
+    k_range: Range<usize>,
+    partial_pane: usize,
+) {
+    debug_assert!(mn_range_bytes.len() >= 64);
+    let full_panes = mn_range_bytes.len() / 64;
+    // Determine if we should use non-temporal stores: large per-row writes and aligned dest
+    let use_nt = (full_panes * 64) >= 64 * 1024; // 64KB threshold
+    let prefetch_distance = 2 * 64 * 16; // 2KB
+
+    for k in 0..k_range.len() {
+        let mut p_row = packed.add(k * 64);
+        let mut b_row =
+            b.offset((k_range.start + k) as isize * k_stride_bytes + mn_range_bytes.start as isize);
+        let p_row_aligned = (p_row as usize) & 63 == 0;
+        for _ in 0..full_panes {
+            // Prefetch upcoming source
+            _mm_prefetch::<_MM_HINT_T0>(b_row.add(prefetch_distance) as *const i8);
+            // Unaligned 64B load
+            let v = _mm512_loadu_si512(b_row as *const __m512i);
+            if use_nt && p_row_aligned {
+                // Stream store requires 64B alignment
+                _mm512_stream_si512(p_row as *mut __m512i, v);
+            } else {
+                _mm512_storeu_si512(p_row as *mut __m512i, v);
+            }
+            p_row = p_row.add(panel_len);
+            b_row = b_row.add(64);
+        }
+        if partial_pane > 0 {
+            // Tail copy
+            std::ptr::copy_nonoverlapping(b_row, p_row, partial_pane);
         }
     }
 }

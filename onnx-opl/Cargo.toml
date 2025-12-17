@@ -1,6 +1,6 @@
 [package]
 name = "tract-onnx-opl"
-version = "0.21.14-pre"
+version = "0.22.1-pre"
 authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
 license = "MIT OR Apache-2.0"
 description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
@@ -15,32 +15,16 @@ maintenance = { status = "actively-developed" }
 
 [dependencies]
 getrandom.workspace = true
-libc.workspace = true
 log.workspace = true
 rand.workspace = true
 rand_distr.workspace = true
-rayon.workspace = true
 rustfft.workspace = true
-simsimd.workspace = true
+simsimd = "6.5"
 tract-nnef.workspace = true
-smallvec = "1"
 
 [dev-dependencies]
 env_logger.workspace = true
-criterion.workspace = true
 
 [features]
 default = []
 getrandom-js = ["getrandom/js"]
-
-[[bench]]
-name = "softmax"
-harness = false
-
-[[bench]]
-name = "argmax"
-harness = false
-
-[[bench]]
-name = "math"
-harness = false

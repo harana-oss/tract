@@ -1,6 +1,6 @@
 [package]
 name = "tract-onnx"
-version = "0.21.14-pre"
+version = "0.22.1-pre"
 authors = ["Mathieu Poumeyrol <kali@zoy.org>"]
 license = "MIT OR Apache-2.0"
 description = "Tiny, no-nonsense, self contained, TensorFlow and ONNX inference"
@@ -20,13 +20,9 @@ maintenance = { status = "actively-developed" }
 [dependencies]
 bytes.workspace = true
 derive-new.workspace = true
-gdt-cpus.workspace = true
 log.workspace = true
 memmap2.workspace = true
 num-integer.workspace = true
-orx-parallel.workspace = true
-par-core.workspace = true
-par-iter.workspace = true
 prost.workspace = true
 rand.workspace = true
 rand_xoshiro.workspace = true
@@ -41,8 +37,6 @@ tract-onnx-opl.workspace = true
 env_logger.workspace = true
 criterion.workspace = true
 ureq = { version = "2", default-features = true }
-libc = "0.2"
-num_cpus = "1"
 
 [[bench]]
 name = "linear_classifier"
@@ -55,10 +49,6 @@ harness = false
 [features]
 default = []
 getrandom-js = ["tract-onnx-opl/getrandom-js"]
-
-[profile.dev]
-debug = 2
-strip = "false"
 
 [profile.release]
 lto = "fat"
