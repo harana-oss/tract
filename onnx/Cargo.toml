@@ -20,9 +20,12 @@ maintenance = { status = "actively-developed" }
 [dependencies]
 bytes.workspace = true
 derive-new.workspace = true
+gdt-cpus.workspace = true
 log.workspace = true
 memmap2.workspace = true
 num-integer.workspace = true
+par-core.workspace = true
+par-iter.workspace = true
 prost.workspace = true
 rand.workspace = true
 rand_xoshiro.workspace = true
