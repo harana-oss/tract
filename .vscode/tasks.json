@@ -1,0 +1,177 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "cargo check onnx-opl",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx-opl"
+			],
+			"problemMatcher": [
+				"$rustc"
+			]
+		},
+		{
+			"label": "cargo check workspace",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			],
+			"problemMatcher": [
+				"$rustc"
+			]
+		},
+		{
+			"label": "cargo check onnx-opl (softmax)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx-opl"
+			],
+			"problemMatcher": [
+				"$rustc"
+			]
+		},
+		{
+			"label": "cargo check onnx-opl (math)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx-opl"
+			]
+		},
+		{
+			"label": "cargo check onnx-opl (math vmms)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx-opl"
+			]
+		},
+		{
+			"label": "cargo check onnx benches",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx"
+			]
+		},
+		{
+			"label": "cargo check data",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check workspace",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			]
+		},
+		{
+			"label": "cargo check data (env cfg)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check workspace (env cfg)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			]
+		},
+		{
+			"label": "cargo check data (readd env cache)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check workspace (readd env cache)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check"
+			]
+		},
+		{
+			"label": "cargo check data (cache clear)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check data (resolve cache)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check data (remove resolve cache)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-data"
+			]
+		},
+		{
+			"label": "cargo check onnx benches (states)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx"
+			]
+		},
+		{
+			"label": "cargo check onnx benches (thread-local states)",
+			"type": "shell",
+			"command": "cargo",
+			"args": [
+				"check",
+				"-p",
+				"tract-onnx",
+				"--benches"
+			]
+		}
+	]
+}

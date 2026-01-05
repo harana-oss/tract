@@ -1,11 +1,17 @@
-use simsimd::SpatialSimilarity;
+#![allow(unsafe_op_in_unsafe_fn)]
+#[cfg(not(target_arch = "aarch64"))]
+compile_error!("NEON-only build: linear_classifier requires target_arch = aarch64");
+
+use super::smallvec::SmallVec;
+use crate::ml::math;
+use crate::ml::{argmax, softmax};
 use std::cell::RefCell;
 use std::hash::{Hash, Hasher};
-use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
 
 thread_local! {
-    static SOFTMAX_TMP: RefCell<[f32; 8]> = RefCell::new([0.0; 8]);
+    static ROWBUF_TL: RefCell<SmallVec<f32, 256>> = RefCell::new(SmallVec::new());
+    static COMPACT_TL: RefCell<SmallVec<f32, 256>> = RefCell::new(SmallVec::new());
 }
 
 pub fn register(registry: &mut Registry) {
@@ -45,6 +51,11 @@ pub struct LinearClassifierData {
     pub feat_c: usize, // feature count
     pub coefficients_raw: Arc<[f32]>, // row-major (eff_e, feat_c)
     pub coefficients_t: Arc<[f32]>, // transposed feature-major (feat_c, eff_e)
+    // Pre-evaluated intercepts/flags
+    pub binary_compact: bool,                  // eff_e == 1 && classes == 2
+    pub bias_scalar: f32,                      // intercepts == Some([b])
+    pub intercepts_eff_e: Option<Arc<[f32]>>,  // intercepts per eff_e classes
+    pub binary_intercepts_2: Option<[f32; 2]>, // intercepts per class in binary expansion
 }
 
 impl Hash for LinearClassifierData {
@@ -65,6 +76,21 @@ pub struct LinearClassifier {
 }
 
 impl LinearClassifier {
+    #[inline(always)]
+    fn tensor1_from_vec_string(v: Vec<String>) -> TractResult<Tensor> {
+        let len = v.len();
+        let mut t = unsafe { Tensor::uninitialized::<String>(&[len]) }?;
+        t.as_slice_mut::<String>()?.clone_from_slice(&v);
+        Ok(t)
+    }
+
+    #[inline(always)]
+    fn tensor1_from_vec_i64(v: Vec<i64>) -> TractResult<Tensor> {
+        let len = v.len();
+        let mut t = unsafe { Tensor::uninitialized::<i64>(&[len]) }?;
+        t.as_slice_mut::<i64>()?.clone_from_slice(&v);
+        Ok(t)
+    }
     pub fn n_classes(&self) -> usize {
         self.data.labels.len()
     }
@@ -72,99 +98,35 @@ impl LinearClassifier {
         &self.data.labels
     }
 
+    // ---- NEON helpers ----
     #[inline(always)]
-    fn matmul_simsimd(input: &ArrayView2<f32>, coef: &ArrayView2<f32>) -> Array2<f32> {
-        let n = input.shape()[0];
-        let e = coef.shape()[0];
-        let mut output = Array2::<f32>::zeros((n, e));
-        for i in 0..n {
-            if let Some(input_row) = input.row(i).as_slice() {
-                for j in 0..e {
-                    if let Some(coef_row) = coef.row(j).as_slice() {
-                        let dot = f32::dot(input_row, coef_row).unwrap_or(0.0) as f32;
-                        output[[i, j]] = dot;
-                    }
-                }
+    fn with_rowbuf<F: FnOnce(&mut [f32]) -> R, R>(len: usize, f: F) -> R {
+        ROWBUF_TL.with(|rb| {
+            let mut v = rb.borrow_mut();
+            let mut h = v.handle();
+            if h.len() < len {
+                h.resize(len, 0.0);
             }
-        }
-        output
+            f(&mut h[..len])
+        })
     }
 
     #[inline(always)]
-    fn softmax_inplace(scores: &mut ArrayViewMut2<f32>) {
-        let n = scores.shape()[0];
-        let e = scores.shape()[1];
-        if e == 1 {
-            return;
-        }
-        if e <= 4 {
-            if let Some(data) = scores.as_slice_mut() {
-                for row in data.chunks_mut(e) {
-                    let mut m = row[0];
-                    for &v in &row[1..e] {
-                        if v > m {
-                            m = v;
-                        }
-                    }
-                    let mut sum = 0.0f32;
-                    for v in row.iter_mut().take(e) {
-                        *v = (*v - m).exp();
-                        sum += *v;
-                    }
-                    let inv = 1.0 / sum;
-                    for v in row.iter_mut().take(e) {
-                        *v *= inv;
-                    }
-                }
-                return;
+    fn with_compact<F: FnOnce(&mut [f32]) -> R, R>(len: usize, f: F) -> R {
+        COMPACT_TL.with(|cb| {
+            let mut v = cb.borrow_mut();
+            let mut h = v.handle();
+            if h.len() < len {
+                h.resize(len, 0.0);
             }
-        }
-        if let Some(data) = scores.as_slice_mut() {
-            for row in data.chunks_mut(e) {
-                let mut max_val = row[0];
-                for val in &row[1..] {
-                    max_val = max_val.max(*val);
-                }
-                let mut sum = 0.0f32;
-                for val in row.iter_mut() {
-                    *val = (*val - max_val).exp();
-                    sum += *val;
-                }
-                let inv_sum = 1.0 / sum;
-                for val in row.iter_mut() {
-                    *val *= inv_sum;
-                }
-            }
-        } else {
-            for i in 0..n {
-                unsafe {
-                    let mut max_val = *scores.uget([i, 0]);
-                    for j in 1..e {
-                        let v = *scores.uget([i, j]);
-                        if v > max_val {
-                            max_val = v;
-                        }
-                    }
-                    let mut sum = 0.0f32;
-                    for j in 0..e {
-                        let slot = scores.uget_mut([i, j]);
-                        *slot = (*slot - max_val).exp();
-                        sum += *slot;
-                    }
-                    let inv = 1.0 / sum;
-                    for j in 0..e {
-                        let slot = scores.uget_mut([i, j]);
-                        *slot *= inv;
-                    }
-                }
-            }
-        }
+            f(&mut h[..len])
+        })
     }
 
     #[inline(always)]
-    fn logistic_inplace(scores: &mut ArrayViewMut2<f32>) {
-        for val in scores.iter_mut() {
-            *val = 1.0 / (1.0 + (-*val).exp());
+    fn logistic_inplace(scores: &mut [f32], n: usize, e: usize) {
+        for v in scores.iter_mut().take(n * e) {
+            *v = 1.0 / (1.0 + (-*v).exp());
         }
     }
 
@@ -174,12 +136,12 @@ impl LinearClassifier {
             let label_slice = self.data.labels.as_slice::<String>()?;
             let mapped: Vec<String> =
                 argmax.iter().map(|&i| label_slice.get(i).cloned().unwrap_or_default()).collect();
-            Ok(Tensor::from(tract_ndarray::arr1(&mapped).into_dyn()))
+            Self::tensor1_from_vec_string(mapped)
         } else if self.data.labels.datum_type() == DatumType::I64 {
             let label_slice = self.data.labels.as_slice::<i64>()?;
             let mapped: Vec<i64> =
                 argmax.iter().map(|&i| label_slice.get(i).copied().unwrap_or(0)).collect();
-            Ok(Tensor::from(tract_ndarray::arr1(&mapped).into_dyn()))
+            Self::tensor1_from_vec_i64(mapped)
         } else {
             bail!("Unsupported label type: {:?}", self.data.labels.datum_type())
         }
@@ -187,26 +149,17 @@ impl LinearClassifier {
 
     // Fused evaluation path producing scores and (optionally) argmax in one pass.
     // Returns (scores_tensor, argmax_indices)
-    fn eval_scores_and_argmax(
+    fn eval_scores_and_argmax_from_tensor(
         &self,
-        input: ArrayViewD<f32>,
+        input: &Tensor,
         want_argmax: bool,
     ) -> TractResult<(Tensor, Option<Vec<usize>>)> {
-        let input_shape = input.shape().to_vec();
-        let (_initial_n, initial_c) = if input.ndim() == 1 {
-            (1, input.len())
-        } else if input.ndim() == 2 {
-            (input_shape[0], input_shape[1])
-        } else {
-            bail!("Expected input rank 1 or 2, got {}", input.ndim())
+        let ishape = input.shape();
+        let (n, c) = match ishape {
+            [c] => (1usize, *c),
+            [n, c] => (*n, *c),
+            other => bail!("Expected input rank 1 or 2, got {} dims", other.len()),
         };
-        let input_2d = if input.ndim() == 1 {
-            input.into_shape_with_order((1, initial_c))?
-        } else {
-            input.into_dimensionality()?
-        };
-        let n = input_2d.shape()[0];
-        let c = input_2d.shape()[1];
         let e = self.n_classes();
         let eff_e = self.data.eff_e;
         let feat_c = self.data.feat_c;
@@ -214,219 +167,524 @@ impl LinearClassifier {
             bail!("Feature count mismatch: expected {}, got {}", feat_c, c);
         }
         let coef_slice: &[f32] = &self.data.coefficients_raw;
-        let intercept_slice_opt: Option<&[f32]> = if let Some(intercepts) = &self.data.intercepts {
-            Some(intercepts.as_slice::<f32>()?)
-        } else {
-            None
-        };
+        let intercepts_eff_e: Option<&[f32]> = self.data.intercepts_eff_e.as_deref();
+        let bias_scalar = self.data.bias_scalar;
+        let binary_intercepts_2 = self.data.binary_intercepts_2;
 
-        // Fast binary single-vector path when compact (eff_e==1,e==2) and no per-class intercepts
+        // Input data access: prefer contiguous slice, fallback to strided reads
+        let input_contig = input.as_slice::<f32>().ok();
+        let input_ptr = if input_contig.is_none() { Some(input.as_ptr::<f32>()?) } else { None };
+        let strides = input.strides().to_vec();
+        let s0 = if n == 1 { 0 } else { strides[0] };
+        let s1 = strides[ishape.len() - 1];
+
+        // Fast binary single-vector path when compact (eff_e==1,e==2)
         if eff_e == 1 && e == 2 {
-            let per_class_intercepts = intercept_slice_opt.map(|s| s.len() == 2).unwrap_or(false);
-            if !per_class_intercepts {
-                // For eff_e==1 row-major slice is contiguous weight vector length feat_c
-                let w = &coef_slice[..feat_c];
-                let bias = intercept_slice_opt
-                    .and_then(|s| if s.len() == 1 { Some(s[0]) } else { None })
-                    .unwrap_or(0.0);
-                let mut scores = Array2::<f32>::zeros((n, 2));
-                let mut argmax: Option<Vec<usize>> = want_argmax.then(|| Vec::with_capacity(n));
-                match self.post_transform {
-                    PostTransformLC::None => {
-                        for i in 0..n {
-                            let mut z = 0f32;
-                            if let Some(row) = input_2d.row(i).as_slice() {
-                                for (x, wv) in row.iter().zip(w.iter()) {
-                                    z += x * wv;
-                                }
+            // For eff_e==1 row-major slice is contiguous weight vector length feat_c
+            let w = &coef_slice[..feat_c];
+            let bias = bias_scalar;
+
+            // Allocate output tensor directly and fill its slice
+            let mut scores_tensor = unsafe { Tensor::uninitialized::<f32>(&[n, 2]) }?;
+            let scores = scores_tensor.as_slice_mut::<f32>()?;
+            let mut argmax: Option<Vec<usize>> = want_argmax.then(|| Vec::with_capacity(n));
+            // scratch buffer for strided rows (thread-local)
+            match self.post_transform {
+                PostTransformLC::None => {
+                    // timing disabled
+                    for i in 0..n {
+                        let mut z: f32;
+                        unsafe {
+                            if let Some(x) = &input_contig {
+                                let row = &x[i * c..(i + 1) * c];
+                                z = math::dot_neon(row, w);
                             } else {
-                                for k in 0..c {
-                                    z += input_2d[[i, k]] * w[k];
-                                }
-                            }
-                            z += bias;
-                            scores[[i, 0]] = -z;
-                            scores[[i, 1]] = z;
-                            if let Some(ref mut a) = argmax {
-                                a.push(if z >= 0.0 { 1 } else { 0 });
+                                let base = input_ptr.unwrap();
+                                z = Self::with_rowbuf(c, |rowbuf| {
+                                    for k in 0..c {
+                                        let off = i as isize * s0 + k as isize * s1;
+                                        rowbuf[k] = *base.offset(off);
+                                    }
+                                    math::dot_neon(&rowbuf[..c], w)
+                                });
                             }
                         }
-                    }
-                    PostTransformLC::Logistic => {
-                        for i in 0..n {
-                            let mut z = 0f32;
-                            if let Some(row) = input_2d.row(i).as_slice() {
-                                for (x, wv) in row.iter().zip(w.iter()) {
-                                    z += x * wv;
-                                }
-                            } else {
-                                for k in 0..c {
-                                    z += input_2d[[i, k]] * w[k];
-                                }
-                            }
-                            z += bias;
-                            let p = 1.0 / (1.0 + (-z).exp());
-                            scores[[i, 0]] = 1.0 - p;
-                            scores[[i, 1]] = p;
-                            if let Some(ref mut a) = argmax {
-                                a.push(if p >= 0.5 { 1 } else { 0 });
-                            }
+                        z += bias;
+                        scores[i * 2] = -z;
+                        scores[i * 2 + 1] = z;
+                        if let Some([b0, b1]) = binary_intercepts_2 {
+                            scores[i * 2] += b0;
+                            scores[i * 2 + 1] += b1;
                         }
-                    }
-                    PostTransformLC::Softmax => {
-                        for i in 0..n {
-                            let mut z = 0f32;
-                            if let Some(row) = input_2d.row(i).as_slice() {
-                                for (x, wv) in row.iter().zip(w.iter()) {
-                                    z += x * wv;
-                                }
-                            } else {
-                                for k in 0..c {
-                                    z += input_2d[[i, k]] * w[k];
-                                }
-                            }
-                            z += bias;
-                            let t = 2.0 * z;
-                            let p = 1.0 / (1.0 + (-t).exp());
-                            scores[[i, 0]] = 1.0 - p;
-                            scores[[i, 1]] = p;
-                            if let Some(ref mut a) = argmax {
-                                a.push(if p >= 0.5 { 1 } else { 0 });
-                            }
+                        if let Some(ref mut a) = argmax {
+                            a.push(if z >= 0.0 { 1 } else { 0 });
                         }
                     }
                 }
-                return Ok((Tensor::from(scores.into_dyn()), argmax));
+                PostTransformLC::Logistic => {
+                    for i in 0..n {
+                        let mut z: f32;
+                        unsafe {
+                            if let Some(x) = &input_contig {
+                                let row = &x[i * c..(i + 1) * c];
+                                z = math::dot_neon(row, w);
+                            } else {
+                                let base = input_ptr.unwrap();
+                                z = Self::with_rowbuf(c, |rowbuf| {
+                                    for k in 0..c {
+                                        let off = i as isize * s0 + k as isize * s1;
+                                        rowbuf[k] = *base.offset(off);
+                                    }
+                                    math::dot_neon(&rowbuf[..c], w)
+                                });
+                            }
+                        }
+                        z += bias;
+                        let p = 1.0 / (1.0 + (-z).exp());
+                        scores[i * 2] = 1.0 - p;
+                        scores[i * 2 + 1] = p;
+                        if let Some([b0, b1]) = binary_intercepts_2 {
+                            scores[i * 2] += b0;
+                            scores[i * 2 + 1] += b1;
+                        }
+                        if let Some(ref mut a) = argmax {
+                            a.push(if p >= 0.5 { 1 } else { 0 });
+                        }
+                    }
+                }
+                PostTransformLC::Softmax => {
+                    for i in 0..n {
+                        let mut z: f32;
+                        unsafe {
+                            if let Some(x) = &input_contig {
+                                let row = &x[i * c..(i + 1) * c];
+                                z = math::dot_neon(row, w);
+                            } else {
+                                let base = input_ptr.unwrap();
+                                z = Self::with_rowbuf(c, |rowbuf| {
+                                    for k in 0..c {
+                                        let off = i as isize * s0 + k as isize * s1;
+                                        rowbuf[k] = *base.offset(off);
+                                    }
+                                    math::dot_neon(&rowbuf[..c], w)
+                                });
+                            }
+                        }
+                        z += bias;
+                        let t = 2.0 * z;
+                        let p = 1.0 / (1.0 + (-t).exp());
+                        scores[i * 2] = 1.0 - p;
+                        scores[i * 2 + 1] = p;
+                        if let Some([b0, b1]) = binary_intercepts_2 {
+                            scores[i * 2] += b0;
+                            scores[i * 2 + 1] += b1;
+                        }
+                        if let Some(ref mut a) = argmax {
+                            a.push(if p >= 0.5 { 1 } else { 0 });
+                        }
+                    }
+                }
+            }
+            return Ok((scores_tensor, argmax));
+        }
+
+        // General path: compute X * W^T using NEON only into a Tensor buffer
+        let mut scores_tensor = unsafe { Tensor::uninitialized::<f32>(&[n, eff_e]) }?;
+        let scores = scores_tensor.as_slice_mut::<f32>()?;
+        unsafe {
+            if let Some(x) = &input_contig {
+                math::matmul_rows_neon_contig(x, n, c, coef_slice, eff_e, scores);
+            } else {
+                let base = input_ptr.unwrap();
+                Self::with_rowbuf(c, |rowbuf| {
+                    math::matmul_rows_neon_gather(
+                        base, n, c, s0, s1, coef_slice, eff_e, scores, rowbuf,
+                    );
+                });
             }
         }
 
-        // General path: build ArrayView2 on precomputed row-major slice, use existing matmul then add intercepts + transforms.
-        let coef_array = ArrayView2::from_shape((eff_e, feat_c), coef_slice)?;
-        let mut scores = Self::matmul_simsimd(&input_2d, &coef_array);
-        if let Some(intercepts) = intercept_slice_opt {
-            if intercepts.len() == eff_e {
-                if let Some(data) = scores.as_slice_mut() {
-                    for row in data.chunks_mut(eff_e) {
-                        for (v, b) in row.iter_mut().zip(intercepts.iter()) {
-                            *v += *b;
-                        }
-                    }
-                } else {
-                    for i in 0..n {
-                        for j in 0..eff_e {
-                            scores[[i, j]] += intercepts[j];
-                        }
-                    }
+        if let Some(intercepts) = intercepts_eff_e {
+            for row in scores.chunks_mut(eff_e) {
+                for (v, b) in row.iter_mut().zip(intercepts.iter()) {
+                    *v += *b;
                 }
-            } else if eff_e == 1 && intercepts.len() == 1 {
-                if let Some(data) = scores.as_slice_mut() {
-                    for v in data.iter_mut() {
-                        *v += intercepts[0];
-                    }
-                } else {
-                    for i in 0..n {
-                        scores[[i, 0]] += intercepts[0];
-                    }
-                }
+            }
+        } else if eff_e == 1 && bias_scalar != 0.0 {
+            for v in scores.iter_mut() {
+                *v += bias_scalar;
             }
         }
         match self.post_transform {
             PostTransformLC::None => {}
             PostTransformLC::Softmax => {
-                Self::softmax_inplace(&mut scores.view_mut());
+                softmax::softmax_inplace_rows(scores, n, eff_e);
             }
             PostTransformLC::Logistic => {
-                Self::logistic_inplace(&mut scores.view_mut());
+                Self::logistic_inplace(scores, n, eff_e);
             }
         }
         if eff_e == 1 && e == 2 {
-            // expand
             let compact = scores;
-            let mut full = Array2::<f32>::zeros((n, 2));
-            if let (Some(src), Some(dst)) = (compact.as_slice(), full.as_slice_mut()) {
-                match self.post_transform {
-                    PostTransformLC::None => {
-                        for (v, row) in src.iter().zip(dst.chunks_mut(2)) {
-                            row[0] = -*v;
-                            row[1] = *v;
-                        }
-                    }
-                    _ => {
-                        for (v, row) in src.iter().zip(dst.chunks_mut(2)) {
-                            row[0] = 1.0 - *v;
-                            row[1] = *v;
-                        }
+            // Expand into a new Tensor of shape [n,2]
+            let mut full_tensor = unsafe { Tensor::uninitialized::<f32>(&[n, 2]) }?;
+            let full = full_tensor.as_slice_mut::<f32>()?;
+            match self.post_transform {
+                PostTransformLC::None => {
+                    for i in 0..n {
+                        let v = compact[i];
+                        full[i * 2] = -v;
+                        full[i * 2 + 1] = v;
                     }
                 }
-            } else {
-                match self.post_transform {
-                    PostTransformLC::None => {
-                        for i in 0..n {
-                            full[[i, 0]] = -compact[[i, 0]];
-                            full[[i, 1]] = compact[[i, 0]];
-                        }
-                    }
-                    _ => {
-                        for i in 0..n {
-                            full[[i, 0]] = 1.0 - compact[[i, 0]];
-                            full[[i, 1]] = compact[[i, 0]];
-                        }
+                _ => {
+                    for i in 0..n {
+                        let v = compact[i];
+                        full[i * 2] = 1.0 - v;
+                        full[i * 2 + 1] = v;
                     }
                 }
             }
-            if let Some(intercepts) = intercept_slice_opt {
-                if intercepts.len() == 2 {
-                    if let Some(data) = full.as_slice_mut() {
-                        for row in data.chunks_mut(2) {
-                            row[0] += intercepts[0];
-                            row[1] += intercepts[1];
-                        }
-                    } else {
-                        for i in 0..n {
-                            full[[i, 0]] += intercepts[0];
-                            full[[i, 1]] += intercepts[1];
-                        }
-                    }
+            if let Some([b0, b1]) = binary_intercepts_2 {
+                for row in full.chunks_mut(2) {
+                    row[0] += b0;
+                    row[1] += b1;
                 }
             }
+
             let mut argmax = want_argmax.then(|| Vec::with_capacity(n));
             if let Some(ref mut a) = argmax {
-                if let Some(data) = full.as_slice() {
-                    for row in data.chunks(2) {
-                        a.push(if row[1] >= row[0] { 1 } else { 0 });
-                    }
-                } else {
-                    for i in 0..n {
-                        a.push(if full[[i, 1]] >= full[[i, 0]] { 1 } else { 0 });
-                    }
+                for row in full.chunks(2) {
+                    a.push(if row[1] >= row[0] { 1 } else { 0 });
                 }
             }
-            return Ok((Tensor::from(full.into_dyn()), argmax));
+            return Ok((full_tensor, argmax));
         }
         let mut argmax = want_argmax.then(|| Vec::with_capacity(n));
         if let Some(ref mut a) = argmax {
-            for i in 0..n {
-                let mut best = 0usize;
-                let mut best_v = scores[[i, 0]];
-                for j in 1..e {
-                    let v = scores[[i, j]];
-                    if v > best_v {
-                        best_v = v;
-                        best = j;
-                    }
-                }
-                a.push(best);
-            }
+            let indices = argmax::argmax_rows(scores, n, eff_e);
+            a.extend(indices);
         }
-        Ok((Tensor::from(scores.into_dyn()), argmax))
+        Ok((scores_tensor, argmax))
     }
 
-    pub fn eval_scores(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
-        let (scores, _) = self.eval_scores_and_argmax(input, false)?;
-        Ok(scores)
+    pub fn eval_scores_into(
+        &self,
+        input: &Tensor,
+        out: &mut [f32],
+        want_argmax: bool,
+    ) -> TractResult<(usize /*n*/, usize /*m_out*/, Option<Vec<usize>>)> {
+        let ishape = input.shape();
+        let (n, c) = match ishape {
+            [c] => (1usize, *c),
+            [n, c] => (*n, *c),
+            other => bail!("Expected input rank 1 or 2, got {} dims", other.len()),
+        };
+        let e = self.n_classes();
+        let eff_e = self.data.eff_e;
+        let feat_c = self.data.feat_c;
+        if feat_c != c {
+            bail!("Feature count mismatch: expected {}, got {}", feat_c, c);
+        }
+        let m_out = if eff_e == 1 && e == 2 { 2 } else { eff_e };
+        ensure!(
+            out.len() == n * m_out,
+            "output buffer has len {}, expected {}",
+            out.len(),
+            n * m_out
+        );
+
+        let coef_slice: &[f32] = &self.data.coefficients_raw;
+        let intercepts_eff_e: Option<&[f32]> = self.data.intercepts_eff_e.as_deref();
+        let bias_scalar = self.data.bias_scalar;
+        let binary_intercepts_2 = self.data.binary_intercepts_2;
+
+        // Input access
+        let input_contig = input.as_slice::<f32>().ok();
+        let input_ptr = if input_contig.is_none() { Some(input.as_ptr::<f32>()?) } else { None };
+        let strides = input.strides().to_vec();
+        let s0 = if n == 1 { 0 } else { strides[0] };
+        let s1 = strides[ishape.len() - 1];
+
+        // Fast binary single-vector path when compact (eff_e==1,e==2)
+        if eff_e == 1 && e == 2 {
+            let w = &coef_slice[..feat_c];
+            let bias = bias_scalar;
+            let mut argmax: Option<Vec<usize>> = want_argmax.then(|| Vec::with_capacity(n));
+            match self.post_transform {
+                PostTransformLC::None => {
+                    for i in 0..n {
+                        let mut z: f32;
+                        unsafe {
+                            if let Some(x) = &input_contig {
+                                let row = &x[i * c..(i + 1) * c];
+                                z = math::dot_neon(row, w);
+                            } else {
+                                let base = input_ptr.unwrap();
+                                z = Self::with_rowbuf(c, |rowbuf| {
+                                    for k in 0..c {
+                                        let off = i as isize * s0 + k as isize * s1;
+                                        rowbuf[k] = *base.offset(off);
+                                    }
+                                    math::dot_neon(&rowbuf[..c], w)
+                                });
+                            }
+                        }
+                        z += bias;
+                        out[i * 2] = -z;
+                        out[i * 2 + 1] = z;
+                        if let Some([b0, b1]) = binary_intercepts_2 {
+                            out[i * 2] += b0;
+                            out[i * 2 + 1] += b1;
+                        }
+                        if let Some(ref mut a) = argmax {
+                            a.push(if z >= 0.0 { 1 } else { 0 });
+                        }
+                    }
+                }
+                PostTransformLC::Logistic => {
+                    for i in 0..n {
+                        let mut z: f32;
+                        unsafe {
+                            if let Some(x) = &input_contig {
+                                let row = &x[i * c..(i + 1) * c];
+                                z = math::dot_neon(row, w);
+                            } else {
+                                let base = input_ptr.unwrap();
+                                z = Self::with_rowbuf(c, |rowbuf| {
+                                    for k in 0..c {
+                                        let off = i as isize * s0 + k as isize * s1;
+                                        rowbuf[k] = *base.offset(off);
+                                    }
+                                    math::dot_neon(&rowbuf[..c], w)
+                                });
+                            }
+                        }
+                        z += bias;
+                        let p = 1.0 / (1.0 + (-z).exp());
+                        out[i * 2] = 1.0 - p;
+                        out[i * 2 + 1] = p;
+                        if let Some([b0, b1]) = binary_intercepts_2 {
+                            out[i * 2] += b0;
+                            out[i * 2 + 1] += b1;
+                        }
+                        if let Some(ref mut a) = argmax {
+                            a.push(if p >= 0.5 { 1 } else { 0 });
+                        }
+                    }
+                }
+                PostTransformLC::Softmax => {
+                    for i in 0..n {
+                        let mut z: f32;
+                        unsafe {
+                            if let Some(x) = &input_contig {
+                                let row = &x[i * c..(i + 1) * c];
+                                z = math::dot_neon(row, w);
+                            } else {
+                                let base = input_ptr.unwrap();
+                                z = Self::with_rowbuf(c, |rowbuf| {
+                                    for k in 0..c {
+                                        let off = i as isize * s0 + k as isize * s1;
+                                        rowbuf[k] = *base.offset(off);
+                                    }
+                                    math::dot_neon(&rowbuf[..c], w)
+                                });
+                            }
+                        }
+                        z += bias;
+                        let t = 2.0 * z;
+                        let p = 1.0 / (1.0 + (-t).exp());
+                        out[i * 2] = 1.0 - p;
+                        out[i * 2 + 1] = p;
+                        if let Some([b0, b1]) = binary_intercepts_2 {
+                            out[i * 2] += b0;
+                            out[i * 2 + 1] += b1;
+                        }
+                        if let Some(ref mut a) = argmax {
+                            a.push(if p >= 0.5 { 1 } else { 0 });
+                        }
+                    }
+                }
+            }
+            return Ok((n, m_out, argmax));
+        }
+
+        // General path
+        if let Some(x) = &input_contig {
+            if m_out == eff_e {
+                unsafe {
+                    math::matmul_rows_neon_contig(x, n, c, coef_slice, eff_e, out);
+                }
+            } else {
+                // compact compute into scratch then expand to out (binary case)
+                debug_assert!(eff_e == 1 && e == 2);
+                let w = &coef_slice[..c];
+                Self::with_compact(n, |compact| {
+                    unsafe {
+                        for i in 0..n {
+                            let row = &x[i * c..(i + 1) * c];
+                            compact[i] = math::dot_neon(row, w);
+                        }
+                    }
+                    // intercepts
+                    if bias_scalar != 0.0 {
+                        for v in compact.iter_mut().take(n) {
+                            *v += bias_scalar;
+                        }
+                    }
+                    // post transform
+                    match self.post_transform {
+                        PostTransformLC::None => {}
+                        PostTransformLC::Softmax => {
+                            softmax::softmax_inplace_rows(&mut compact[..n], n, 1)
+                        }
+                        PostTransformLC::Logistic => {
+                            Self::logistic_inplace(&mut compact[..n], n, 1)
+                        }
+                    }
+                    // expand to out (and optional per-class intercepts)
+                    for i in 0..n {
+                        let v = compact[i];
+                        match self.post_transform {
+                            PostTransformLC::None => {
+                                out[i * 2] = -v;
+                                out[i * 2 + 1] = v;
+                            }
+                            _ => {
+                                out[i * 2] = 1.0 - v;
+                                out[i * 2 + 1] = v;
+                            }
+                        }
+                    }
+                    if let Some([b0, b1]) = binary_intercepts_2 {
+                        for row in out.chunks_mut(2) {
+                            row[0] += b0;
+                            row[1] += b1;
+                        }
+                    }
+                });
+            }
+        } else {
+            // strided input
+            if m_out == eff_e {
+                unsafe {
+                    let base = input_ptr.unwrap();
+                    Self::with_rowbuf(c, |rowbuf| {
+                        math::matmul_rows_neon_gather(
+                            base, n, c, s0, s1, coef_slice, eff_e, out, rowbuf,
+                        );
+                    });
+                }
+            } else {
+                debug_assert!(eff_e == 1 && e == 2);
+                let w = &coef_slice[..c];
+                Self::with_compact(n, |compact| {
+                    let base = input_ptr.unwrap();
+                    Self::with_rowbuf(c, |rowbuf| {
+                        for i in 0..n {
+                            for k in 0..c {
+                                let off = i as isize * s0 + k as isize * s1;
+                                rowbuf[k] = unsafe { *base.offset(off) };
+                            }
+                            compact[i] = unsafe { math::dot_neon(&rowbuf[..c], w) };
+                        }
+                    });
+                    if bias_scalar != 0.0 {
+                        for v in compact.iter_mut().take(n) {
+                            *v += bias_scalar;
+                        }
+                    }
+                    match self.post_transform {
+                        PostTransformLC::None => {}
+                        PostTransformLC::Softmax => {
+                            softmax::softmax_inplace_rows(&mut compact[..n], n, 1)
+                        }
+                        PostTransformLC::Logistic => {
+                            Self::logistic_inplace(&mut compact[..n], n, 1)
+                        }
+                    }
+                    for i in 0..n {
+                        let v = compact[i];
+                        match self.post_transform {
+                            PostTransformLC::None => {
+                                out[i * 2] = -v;
+                                out[i * 2 + 1] = v;
+                            }
+                            _ => {
+                                out[i * 2] = 1.0 - v;
+                                out[i * 2 + 1] = v;
+                            }
+                        }
+                    }
+                    if let Some([b0, b1]) = binary_intercepts_2 {
+                        for row in out.chunks_mut(2) {
+                            row[0] += b0;
+                            row[1] += b1;
+                        }
+                    }
+                });
+            }
+        }
+
+        // Add intercepts (per-class) for m_out == eff_e case
+        if m_out == eff_e {
+            if let Some(intercepts) = intercepts_eff_e {
+                for row in out.chunks_mut(eff_e) {
+                    for (v, b) in row.iter_mut().zip(intercepts.iter()) {
+                        *v += *b;
+                    }
+                }
+            } else if eff_e == 1 && bias_scalar != 0.0 {
+                for v in out.iter_mut() {
+                    *v += bias_scalar;
+                }
+            }
+            match self.post_transform {
+                PostTransformLC::None => {}
+                PostTransformLC::Softmax => softmax::softmax_inplace_rows(out, n, eff_e),
+                PostTransformLC::Logistic => Self::logistic_inplace(out, n, eff_e),
+            }
+        }
+
+        let mut argmax = want_argmax.then(|| Vec::with_capacity(n));
+        if let Some(ref mut a) = argmax {
+            if m_out == 2 && eff_e == 1 && e == 2 {
+                for row in out.chunks(2) {
+                    a.push(if row[1] >= row[0] { 1 } else { 0 });
+                }
+            } else {
+                let indices = argmax::argmax_rows(out, n, m_out);
+                a.extend(indices);
+            }
+        }
+
+        Ok((n, m_out, argmax))
     }
-    pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<(Tensor, Tensor)> {
-        let (scores, argmax) = self.eval_scores_and_argmax(input, true)?;
+
+    /// Compute scores, then normalize them in-place per row using the requested norm.
+    /// This avoids allocating a second buffer and a separate normalization pass.
+    pub fn eval_scores_normalized_into(
+        &self,
+        input: &Tensor,
+        out: &mut [f32],
+        want_argmax: bool,
+        norm_kind: crate::ml::normalizer::NormKind,
+    ) -> TractResult<(usize /*n*/, usize /*m_out*/, Option<Vec<usize>>)> {
+        // If Softmax is requested and the normalization is L1, skip Normalizer: softmax already
+        // produces L1-normalized rows. Avoids an unnecessary extra pass.
+        if self.post_transform == PostTransformLC::Softmax
+            && matches!(norm_kind, crate::ml::normalizer::NormKind::L1)
+        {
+            return self.eval_scores_into(input, out, want_argmax);
+        }
+        let (n, m, argmax) = self.eval_scores_into(input, out, want_argmax)?;
+        let normalizer = crate::ml::normalizer::Normalizer { kind: norm_kind };
+        normalizer.eval_inplace_rows(out, n, m)?;
+        Ok((n, m, argmax))
+    }
+
+    pub fn eval_from_tensor(&self, input: &Tensor) -> TractResult<(Tensor, Tensor)> {
+        let (scores, argmax) = self.eval_scores_and_argmax_from_tensor(input, true)?;
         let labels = if let Some(argmax) = argmax {
             self.labels_from_argmax(&argmax)?
         } else {
@@ -436,22 +694,13 @@ impl LinearClassifier {
     }
 
     fn compute_labels(&self, scores: &Tensor) -> TractResult<Tensor> {
-        let scores_view = scores.to_array_view::<f32>()?;
-        let scores_2d: ArrayView2<f32> = scores_view.into_dimensionality()?;
-        let n = scores_2d.shape()[0];
-
-        let mut argmax_indices = Vec::with_capacity(n);
-        for i in 0..n {
-            let mut max_idx = 0;
-            let mut max_val = scores_2d[[i, 0]];
-            for j in 1..scores_2d.shape()[1] {
-                if scores_2d[[i, j]] > max_val {
-                    max_val = scores_2d[[i, j]];
-                    max_idx = j;
-                }
-            }
-            argmax_indices.push(max_idx);
-        }
+        let shape = scores.shape();
+        let (n, e) = match shape {
+            [n, e] => (*n, *e),
+            other => bail!("scores must be 2D, got {} dims", other.len()),
+        };
+        let data = scores.as_slice::<f32>()?;
+        let argmax_indices = argmax::argmax_rows(data, n, e);
 
         let labels = if self.data.labels.datum_type() == DatumType::String {
             let label_slice = self.data.labels.as_slice::<String>()?;
@@ -459,14 +708,14 @@ impl LinearClassifier {
                 .iter()
                 .map(|&idx| label_slice.get(idx).cloned().unwrap_or_default())
                 .collect();
-            Tensor::from(tract_ndarray::arr1(&mapped).into_dyn())
+            Self::tensor1_from_vec_string(mapped)?
         } else if self.data.labels.datum_type() == DatumType::I64 {
             let label_slice = self.data.labels.as_slice::<i64>()?;
             let mapped: Vec<i64> = argmax_indices
                 .iter()
                 .map(|&idx| label_slice.get(idx).copied().unwrap_or(0))
                 .collect();
-            Tensor::from(tract_ndarray::arr1(&mapped).into_dyn())
+            Self::tensor1_from_vec_i64(mapped)?
         } else {
             bail!("Unsupported label type: {:?}", self.data.labels.datum_type())
         };
@@ -490,8 +739,7 @@ impl EvalOp for LinearClassifier {
     fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
         let input = args_1!(inputs);
         let input = input.cast_to::<f32>()?;
-        let input = input.to_array_view::<f32>()?;
-        let (labels, scores) = self.eval(input)?;
+        let (labels, scores) = self.eval_from_tensor(&input)?;
         Ok(tvec!(labels.into_tvalue(), scores.into_tvalue()))
     }
 }
@@ -501,6 +749,36 @@ impl TypedOp for LinearClassifier {
         let n = &inputs[0].shape[0];
         let label_dt = self.data.labels.datum_type();
         Ok(tvec!(label_dt.fact(&[n.clone()]), f32::fact(&[n.clone(), self.n_classes().into()])))
+    }
+
+    fn fuse(&self, model: &TypedModel, node: &TypedNode) -> TractResult<Option<TypedModelPatch>> {
+        // Fuse when LC's scores (outlet 1) are consumed by a single Normalizer.
+        // We will replace LC -> Normalizer with a single op that computes LC then normalizes scores.
+        if node.outputs.len() < 2 {
+            return Ok(None);
+        }
+        let succs = &model.node(node.id).outputs[1].successors;
+        if succs.len() != 1 {
+            return Ok(None);
+        }
+        let succ_inlet = succs[0];
+        let succ_node = model.node(succ_inlet.node);
+        let Some(norm) = succ_node.op_as::<crate::ml::normalizer::Normalizer>() else {
+            return Ok(None);
+        };
+
+        // Build a patch that replaces LinearClassifier -> Normalizer(scores) with a single fused op
+        let mut patch = TypedModelPatch::default();
+        let fused_input = patch.taps(model, &[node.inputs[0]])?[0];
+        let fused = PostNormalizedLinearClassifier { lc: self.clone(), norm_kind: norm.kind };
+        let out =
+            patch.wire_node(format!("{}._fused_lc_postnorm", node.name), fused, &[fused_input])?;
+        // Redirect labels users from LC[0] to fused[0]
+        patch.shunt_outside(model, OutletId::new(node.id, 0), out[0])?;
+        // Redirect scores users from Normalizer[0] to fused[1]
+        patch.shunt_outside(model, OutletId::new(succ_node.id, 0), out[1])?;
+        patch.dont_apply_twice = Some(format!("fuse-lc-into-post-normalizer@{}", node.id));
+        Ok(Some(patch))
     }
 
     as_op!();
@@ -551,7 +829,7 @@ fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractRes
     let input = invocation.named_arg_as(builder, "input")?;
     let labels: Arc<Tensor> = invocation.named_arg_as(builder, "labels")?;
     let coefficients: Arc<Tensor> = invocation.named_arg_as(builder, "coefficients")?;
-    let intercepts = invocation.named_arg_as(builder, "intercepts").ok();
+    let intercepts: Option<Arc<Tensor>> = invocation.named_arg_as(builder, "intercepts").ok();
     let multi_class = invocation.named_arg_as(builder, "multi_class")?;
     let post_transform: String = invocation.named_arg_as(builder, "post_transform")?;
     let post_transform = parse_post_transform(&post_transform)?;
@@ -596,6 +874,22 @@ fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractRes
     let coefficients_raw: Arc<[f32]> = coef_slice.to_vec().into();
     let coefficients_t: Arc<[f32]> = transposed.into();
 
+    // Precompute intercept flavours
+    let binary_compact = eff_e == 1 && e == 2;
+    let mut bias_scalar: f32 = 0.0;
+    let mut intercepts_eff_e: Option<Arc<[f32]>> = None;
+    let mut binary_intercepts_2: Option<[f32; 2]> = None;
+    if let Some(b) = &intercepts {
+        let bsl = b.as_slice::<f32>()?;
+        if bsl.len() == 1 {
+            bias_scalar = bsl[0];
+        } else if bsl.len() == eff_e {
+            intercepts_eff_e = Some(bsl.to_vec().into());
+        } else if binary_compact && bsl.len() == 2 {
+            binary_intercepts_2 = Some([bsl[0], bsl[1]]);
+        }
+    }
+
     let data = LinearClassifierData {
         labels: labels.clone(),
         coefficients: coefficients.clone(),
@@ -604,7 +898,68 @@ fn load(builder: &mut ModelBuilder, invocation: &ResolvedInvocation) -> TractRes
         feat_c,
         coefficients_raw,
         coefficients_t,
+        binary_compact,
+        bias_scalar,
+        intercepts_eff_e,
+        binary_intercepts_2,
     };
     let op = LinearClassifier { data, multi_class, post_transform };
     builder.wire(op, &[input])
+}
+
+#[derive(Debug, Clone, Hash)]
+pub struct PostNormalizedLinearClassifier {
+    pub lc: LinearClassifier,
+    pub norm_kind: crate::ml::normalizer::NormKind,
+}
+
+impl Op for PostNormalizedLinearClassifier {
+    fn name(&self) -> StaticName {
+        "PostNormalizedLinearClassifier".into()
+    }
+    fn info(&self) -> TractResult<Vec<String>> {
+        Ok(vec![format!(
+            "norm={:?}, post={:?}, classes={}",
+            self.norm_kind,
+            self.lc.post_transform,
+            self.lc.n_classes()
+        )])
+    }
+    op_as_typed_op!();
+}
+
+impl EvalOp for PostNormalizedLinearClassifier {
+    fn is_stateless(&self) -> bool {
+        true
+    }
+    fn eval(&self, inputs: TVec<TValue>) -> TractResult<TVec<TValue>> {
+        let input = args_1!(inputs);
+        let input = input.cast_to::<f32>()?;
+        let ishape = input.shape().to_vec();
+        let (outer, _in_c) = match ishape.as_slice() {
+            [c] => (1usize, *c),
+            [n, c] => (*n, *c),
+            other => bail!("Expected input rank 1 or 2, got {} dims", other.len()),
+        };
+        let eff_e = self.lc.data.eff_e;
+        let e = self.lc.n_classes();
+        let m_out = if eff_e == 1 && e == 2 { 2 } else { eff_e };
+        let mut scores_tensor = unsafe { Tensor::uninitialized::<f32>(&[outer, m_out]) }?;
+        let scores_buf = scores_tensor.as_slice_mut::<f32>()?;
+        let (_n, _m, argmax) =
+            self.lc.eval_scores_normalized_into(&input, scores_buf, true, self.norm_kind)?;
+        let labels = if let Some(argmax) = argmax {
+            self.lc.labels_from_argmax(&argmax)?
+        } else {
+            self.lc.compute_labels(&scores_tensor)?
+        };
+        Ok(tvec!(labels.into_tvalue(), scores_tensor.into_tvalue()))
+    }
+}
+
+impl TypedOp for PostNormalizedLinearClassifier {
+    fn output_facts(&self, inputs: &[&TypedFact]) -> TractResult<TVec<TypedFact>> {
+        self.lc.output_facts(inputs)
+    }
+    as_op!();
 }

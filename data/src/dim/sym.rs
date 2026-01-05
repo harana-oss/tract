@@ -1,9 +1,9 @@
 use itertools::Itertools;
 use parking_lot::ReentrantMutex;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use string_interner::DefaultStringInterner;
 use string_interner::Symbol as _;
 
@@ -28,6 +28,7 @@ pub struct SymbolScopeData {
     table: DefaultStringInterner,
     assertions: Vec<Assertion>,
     scenarios: Vec<(String, Vec<Assertion>)>,
+    symbols_cache: RefCell<HashMap<super::TDim, HashSet<Symbol>>>,
 }
 
 impl SymbolScope {
@@ -170,6 +171,26 @@ impl SymbolScope {
 }
 
 impl SymbolScopeData {
+    // Read-once env gate for symbols cache. Default: enabled.
+    fn symbols_cache_enabled() -> bool {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            let val = std::env::var("TRACT_SYMBOLS_CACHE").ok();
+            match val.as_deref().map(|s| s.trim()) {
+                // Explicit off values
+                Some("0") | Some("false") | Some("False") | Some("FALSE") | Some("off")
+                | Some("OFF") | Some("no") | Some("NO") => {
+                    log::debug!("SymbolScope symbols_cache disabled via TRACT_SYMBOLS_CACHE");
+                    false
+                }
+                // Explicit on values
+                Some("1") | Some("true") | Some("True") | Some("TRUE") | Some("on")
+                | Some("ON") | Some("yes") | Some("YES") => true,
+                // Unset or unrecognized => default to enabled for performance
+                _ => true,
+            }
+        })
+    }
     pub fn all_assertions(&self) -> &[Assertion] {
         &self.assertions
     }
@@ -195,6 +216,33 @@ impl SymbolScopeData {
     pub fn resolving<R>(&self, sym: &Symbol, f: impl FnOnce(&str) -> R) -> Option<R> {
         self.table.resolve(sym.1).map(f)
     }
+
+    // Symbols cache API used by TDim::symbols
+    pub(crate) fn symbols_cache_get(&self, key: &super::TDim) -> Option<HashSet<Symbol>> {
+        if !Self::symbols_cache_enabled() {
+            return None;
+        }
+        self.symbols_cache.borrow().get(key).cloned()
+    }
+
+    pub(crate) fn symbols_cache_put(&self, key: super::TDim, value: HashSet<Symbol>) {
+        if !Self::symbols_cache_enabled() {
+            return;
+        }
+        // Simple guard to keep memory in check for long sessions.
+        // If the cache grows too large, clear it.
+        const MAX_CACHE_ENTRIES: usize = 4096;
+        let mut cache = self.symbols_cache.borrow_mut();
+        if cache.len() >= MAX_CACHE_ENTRIES {
+            log::warn!(
+                "SymbolScope symbols_cache exceeded {MAX_CACHE_ENTRIES} entries, clearing cache."
+            );
+            cache.clear();
+        }
+        cache.insert(key, value);
+    }
+
+    // (resolve cache removed)
 
     #[allow(clippy::mutable_key_type)]
     pub fn prove_positive_or_zero(&self, t: &TDim) -> bool {

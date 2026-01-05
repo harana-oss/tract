@@ -80,6 +80,8 @@ where
     order: Vec<usize>,
     flush_lists: Vec<TVec<usize>>,
     has_unresolved_symbols: bool,
+    // For each node, for each output, list indices of dims that contain symbols (precomputed)
+    symbolic_output_dims: Vec<Vec<Vec<usize>>>,
     executor: Option<Executor>,
     session_handler: Option<Arc<dyn SessionStateHandler + 'static>>,
     _casper: PhantomData<(F, O)>,
@@ -151,12 +153,28 @@ where
 
         #[allow(clippy::mutable_key_type)]
         let mut symbols: std::collections::HashSet<Symbol> = Default::default();
+        // Precompute which output dims are symbolic to skip work at runtime
+        let mut symbolic_output_dims: Vec<Vec<Vec<usize>>> =
+            vec![vec![]; model.borrow().nodes.len()];
         for node in &model.borrow().nodes {
+            let mut node_outputs: Vec<Vec<usize>> = Vec::with_capacity(node.outputs.len());
             for output in &node.outputs {
                 if let Ok(fact) = output.fact.to_typed_fact() {
-                    symbols.extend(fact.shape.iter().flat_map(|d| d.symbols()))
+                    // Track all symbols for global flag
+                    symbols.extend(fact.shape.iter().flat_map(|d| d.symbols()));
+                    // Record indices of dimensions that are symbolic
+                    let dims_with_symbols = fact
+                        .shape
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(ix, d)| if d.symbols().len() > 0 { Some(ix) } else { None })
+                        .collect::<Vec<_>>();
+                    node_outputs.push(dims_with_symbols);
+                } else {
+                    node_outputs.push(Vec::new());
                 }
             }
+            symbolic_output_dims[node.id] = node_outputs;
         }
         Ok(SimplePlan {
             model,
@@ -164,6 +182,7 @@ where
             flush_lists,
             outputs: outputs.to_vec(),
             has_unresolved_symbols: !symbols.is_empty(),
+            symbolic_output_dims,
             _casper: PhantomData,
             executor: options.executor.clone(),
             session_handler: None,
@@ -401,14 +420,19 @@ where
                 .map_err(|e| e.into())?;
 
                 if plan.has_unresolved_symbols {
-                    for (o, v) in node.outputs.iter().zip(vs.iter()) {
+                    // Only attempt to resolve dims that are known to contain symbols for this node
+                    let symbolic = &plan.symbolic_output_dims[node.id];
+                    for ((o, v), dims) in node.outputs.iter().zip(vs.iter()).zip(symbolic.iter()) {
+                        if dims.is_empty() {
+                            continue;
+                        }
                         if let Ok(f) = o.fact.to_typed_fact() {
-                            for (dim_abstract, dim_concrete) in f.shape.iter().zip(v.shape()) {
-                                Self::resolve(
-                                    &mut self.session_state,
-                                    dim_abstract,
-                                    *dim_concrete as i64,
-                                )?;
+                            let vshape = v.shape();
+                            for &ix in dims {
+                                // Safety: dims were computed from the same fact shape length
+                                let dim_abstract = &f.shape[ix];
+                                let dim_concrete = vshape[ix] as i64;
+                                Self::resolve(&mut self.session_state, dim_abstract, dim_concrete)?;
                             }
                         }
                     }
@@ -464,25 +488,29 @@ where
     }
 
     fn resolve(state: &mut SessionState, expression: &TDim, provided: i64) -> TractResult<()> {
+        // Fast-path: if already fully concrete, just compare and return
         let expected = expression.eval(&state.resolved_symbols);
         if let Ok(x) = expected.to_i64() {
-            if x != provided {
-                bail!(
-                    "Clashing resolution for expression. {expression}={x} != {provided}. ({state:?})"
-                )
-            }
+            ensure!(
+                x == provided,
+                "Clashing resolution for expression. {expression}={x} != {provided}. ({state:?})"
+            );
+            return Ok(());
         }
+
+        // Only when exactly one symbol is present can we solve directly
         if expected.symbols().len() == 1 {
             let sym = expected.symbols().into_iter().next().unwrap();
             if let Some(v) = solve_for(&sym, &expected, &provided.to_dim()) {
                 debug!("Determined symbol {sym}={v}");
-                state.resolved_symbols.set(&sym, v.to_i64().unwrap());
-            }
-            if state.scenario.is_none() {
-                let scope = sym
-                    .scope()
-                    .with_context(|| format!("Symbol {sym:?} points to an invalid (dead ?) SymbolScope. Make sure to create symbols using the model-managed SymbolScope."))?;
-                state.scenario = scope.guess_scenario(&state.resolved_symbols)?;
+                let val = v.to_i64()?;
+                state.resolved_symbols.set(&sym, val);
+                if state.scenario.is_none() {
+                    let scope = sym.scope().with_context(|| format!(
+                        "Symbol {sym:?} points to an invalid (dead ?) SymbolScope. Make sure to create symbols using the model-managed SymbolScope."
+                    ))?;
+                    state.scenario = scope.guess_scenario(&state.resolved_symbols)?;
+                }
             }
         }
         Ok(())

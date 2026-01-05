@@ -1,9 +1,13 @@
 use tract_nnef::internal::*;
 
+pub mod argmax;
 pub mod category_mapper;
 pub mod linear_classifier;
 pub mod linear_regressor;
+pub mod math;
 pub mod normalizer;
+pub mod smallvec;
+pub mod softmax;
 pub mod tree;
 pub mod tree_ensemble_classifier;
 

@@ -32,6 +32,8 @@ num-integer.workspace = true
 num-traits.workspace = true
 num-complex.workspace = true
 openblas-src = { workspace=true, optional = true }
+par-core.workspace = true
+par-iter.workspace = true
 pastey.workspace = true
 rustfft.workspace = true
 smallvec.workspace = true

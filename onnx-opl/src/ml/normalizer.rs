@@ -1,12 +1,12 @@
+// NEON-only normalizer; restrict to aarch64 builds
 #![allow(unsafe_op_in_unsafe_fn)]
-
+#[cfg(not(target_arch = "aarch64"))]
+compile_error!("NEON-only build: normalizer requires target_arch = aarch64");
 use tract_ndarray::prelude::*;
 use tract_nnef::internal::*;
 
-#[cfg(target_arch = "aarch64")]
 use std::arch::aarch64::*;
 
-#[cfg(target_arch = "aarch64")]
 const NEON_SMALL_FAST_C: usize = 128;
 
 pub fn register(registry: &mut Registry) {
@@ -43,8 +43,6 @@ pub struct Normalizer {
 impl Normalizer {
     pub fn eval(&self, input: ArrayViewD<f32>) -> TractResult<Tensor> {
         let rank = input.ndim();
-        ensure!(rank >= 1, "Normalizer expects rank 1 or 2 inputs");
-
         let shape = input.shape();
         let c = shape[rank - 1];
         let outer = shape[..rank - 1].iter().product::<usize>();
@@ -54,25 +52,45 @@ impl Normalizer {
 
         let mut output = vec![0.0f32; input_slice.len()];
 
-        #[cfg(target_arch = "aarch64")]
         unsafe {
             self.eval_neon(input_slice, &mut output, outer, c);
         }
 
-        #[cfg(not(target_arch = "aarch64"))]
-        {
-            self.eval_scalar(input_slice, &mut output, outer, c);
-        }
-
-        let output_arr = ArrayD::from_shape_vec(shape.to_vec(), output)?;
-        Ok(output_arr.into_tensor())
+        Tensor::from_shape(shape, &output)
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
+    /// Slice-based normalization that reuses the same NEON/scalar paths as `eval`,
+    /// without constructing ndarray views. `outer` is the product of leading dims,
+    /// and `c` is the size of the last dimension.
+    pub fn eval_into_slices(
+        &self,
+        input: &[f32],
+        output: &mut [f32],
+        outer: usize,
+        c: usize,
+    ) -> TractResult<()> {
+        ensure!(input.len() == output.len());
+        ensure!(input.len() == outer * c);
+        unsafe {
+            self.eval_neon(input, output, outer, c);
+        }
+        Ok(())
+    }
+
+    /// In-place variant: normalize rows directly in the provided buffer.
+    /// The buffer must be shaped as (outer, c) in row-major order.
+    pub fn eval_inplace_rows(&self, data: &mut [f32], outer: usize, c: usize) -> TractResult<()> {
+        ensure!(data.len() == outer * c);
+        unsafe {
+            // Create a temporary immutable alias to the same memory to satisfy the API
+            let input_alias = std::slice::from_raw_parts(data.as_ptr(), data.len());
+            self.eval_neon(input_alias, data, outer, c);
+        }
+        Ok(())
+    }
+
     unsafe fn eval_neon(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
         const EPS: f32 = 1e-12;
-        const NEON_SMALL_FAST_C: usize = 128;
 
         for i in 0..outer {
             let offset = i * c;
@@ -109,8 +127,6 @@ impl Normalizer {
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn normalize_small_max_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
@@ -151,20 +167,15 @@ impl Normalizer {
         max_vec0 = vmaxq_f32(max_vec0, max_vec2);
         let mut max = horizontal_max_f32x4(max_vec0);
 
-        // Handle remaining elements with 4-wide SIMD
+        // Process remaining elements with 4-wide SIMD (accumulate only)
         if i + 4 <= len {
             let v = vld1q_f32(row.as_ptr().add(i));
             let abs_v = vabsq_f32(v);
             max = max.max(horizontal_max_f32x4(abs_v));
-
-            let scale = 1.0 / max.max(EPS);
-            let scale_vec = vdupq_n_f32(scale);
-            let scaled = vmulq_f32(v, scale_vec);
-            vst1q_f32(out_row.as_mut_ptr().add(i), scaled);
             i += 4;
         }
 
-        // Scalar tail
+        // Scalar tail (accumulate only)
         while i < len {
             max = max.max(row[i].abs());
             i += 1;
@@ -186,14 +197,20 @@ impl Normalizer {
             );
         }
 
-        let base = chunk_count * 16 + ((len - chunk_count * 16) & !3);
-        for t in base..len {
-            out_row[t] = row[t] * scale;
+        // Write remainder after final scale
+        let mut j = chunk_count * 16;
+        while j + 4 <= len {
+            let v = vld1q_f32(row.as_ptr().add(j));
+            let scaled = vmulq_f32(v, scale_vec);
+            vst1q_f32(out_row.as_mut_ptr().add(j), scaled);
+            j += 4;
+        }
+        while j < len {
+            out_row[j] = row[j] * scale;
+            j += 1;
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn normalize_small_l1_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
@@ -234,20 +251,15 @@ impl Normalizer {
         sum_vec0 = vaddq_f32(sum_vec0, sum_vec2);
         let mut sum = horizontal_sum_f32x4(sum_vec0);
 
-        // Handle remaining elements with 4-wide SIMD
+        // Process remaining elements with 4-wide SIMD (accumulate only)
         if i + 4 <= len {
             let v = vld1q_f32(row.as_ptr().add(i));
             let abs_v = vabsq_f32(v);
             sum += horizontal_sum_f32x4(abs_v);
-
-            let scale = 1.0 / sum.max(EPS);
-            let scale_vec = vdupq_n_f32(scale);
-            let scaled = vmulq_f32(v, scale_vec);
-            vst1q_f32(out_row.as_mut_ptr().add(i), scaled);
             i += 4;
         }
 
-        // Scalar tail
+        // Scalar tail (accumulate only)
         while i < len {
             sum += row[i].abs();
             i += 1;
@@ -269,14 +281,20 @@ impl Normalizer {
             );
         }
 
-        let base = chunk_count * 16 + ((len - chunk_count * 16) & !3);
-        for t in base..len {
-            out_row[t] = row[t] * scale;
+        // Write remainder after final scale
+        let mut j = chunk_count * 16;
+        while j + 4 <= len {
+            let v = vld1q_f32(row.as_ptr().add(j));
+            let scaled = vmulq_f32(v, scale_vec);
+            vst1q_f32(out_row.as_mut_ptr().add(j), scaled);
+            j += 4;
+        }
+        while j < len {
+            out_row[j] = row[j] * scale;
+            j += 1;
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn normalize_small_l2_neon(&self, row: &[f32], out_row: &mut [f32]) {
         const EPS: f32 = 1e-12;
         let len = row.len();
@@ -314,21 +332,16 @@ impl Normalizer {
         sum_vec0 = vaddq_f32(sum_vec0, sum_vec2);
         let mut sum = horizontal_sum_f32x4(sum_vec0);
 
-        // Handle remaining elements with 4-wide SIMD
+        // Process remaining elements with 4-wide SIMD (accumulate only)
         if i + 4 <= len {
             let v = vld1q_f32(row.as_ptr().add(i));
             let mut accum = vdupq_n_f32(0.0);
             accum = vfmaq_f32(accum, v, v);
             sum += horizontal_sum_f32x4(accum);
-
-            let scale = self.reciprocal_sqrt_neon(sum.max(EPS));
-            let scale_vec = vdupq_n_f32(scale);
-            let scaled = vmulq_f32(v, scale_vec);
-            vst1q_f32(out_row.as_mut_ptr().add(i), scaled);
             i += 4;
         }
 
-        // Scalar tail
+        // Scalar tail (accumulate only)
         while i < len {
             let val = row[i];
             sum += val * val;
@@ -351,14 +364,20 @@ impl Normalizer {
             );
         }
 
-        let base = chunk_count * 16 + ((len - chunk_count * 16) & !3);
-        for t in base..len {
-            out_row[t] = row[t] * scale;
+        // Write remainder after final scale
+        let mut j = chunk_count * 16;
+        while j + 4 <= len {
+            let v = vld1q_f32(row.as_ptr().add(j));
+            let scaled = vmulq_f32(v, scale_vec);
+            vst1q_f32(out_row.as_mut_ptr().add(j), scaled);
+            j += 4;
+        }
+        while j < len {
+            out_row[j] = row[j] * scale;
+            j += 1;
         }
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn reciprocal_sqrt_neon(&self, x: f32) -> f32 {
         let v = vdupq_n_f32(x);
         let estimate = vrsqrteq_f32(v);
@@ -371,8 +390,6 @@ impl Normalizer {
         vgetq_lane_f32(refined2, 0)
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn compute_max_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -421,8 +438,6 @@ impl Normalizer {
         max
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn compute_l1_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -471,8 +486,6 @@ impl Normalizer {
         sum
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn compute_l2_norm_neon(&self, slice: &[f32]) -> f32 {
         let len = slice.len();
         let mut i = 0;
@@ -518,8 +531,6 @@ impl Normalizer {
         sum
     }
 
-    #[cfg(target_arch = "aarch64")]
-    #[target_feature(enable = "neon")]
     unsafe fn scale_neon(&self, input: &[f32], output: &mut [f32], scale: f32) {
         let scale_vec = vdupq_n_f32(scale);
         let len = input.len();
@@ -554,42 +565,15 @@ impl Normalizer {
         }
     }
 
-    fn eval_scalar(&self, input: &[f32], output: &mut [f32], outer: usize, c: usize) {
-        const EPS: f32 = 1e-12;
-
-        for i in 0..outer {
-            let offset = i * c;
-            let row = &input[offset..offset + c];
-            let out_row = &mut output[offset..offset + c];
-
-            let norm = match self.kind {
-                NormKind::Max => row.iter().map(|x| x.abs()).fold(f32::MIN, f32::max),
-                NormKind::L1 => row.iter().map(|x| x.abs()).sum::<f32>(),
-                NormKind::L2 => row.iter().map(|x| x * x).sum::<f32>(),
-            };
-
-            let scale = match self.kind {
-                NormKind::L2 => 1.0 / norm.max(EPS).sqrt(),
-                _ => 1.0 / norm.max(EPS),
-            };
-
-            for (o, &val) in out_row.iter_mut().zip(row.iter()) {
-                *o = val * scale;
-            }
-        }
-    }
+    // Scalar fallbacks removed for NEON-only build
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
 unsafe fn horizontal_sum_f32x4(v: float32x4_t) -> f32 {
     let pair_sum = vpaddq_f32(v, v);
     let final_sum = vpaddq_f32(pair_sum, pair_sum);
     vgetq_lane_f32(final_sum, 0)
 }
 
-#[cfg(target_arch = "aarch64")]
-#[target_feature(enable = "neon")]
 unsafe fn horizontal_max_f32x4(v: float32x4_t) -> f32 {
     let pair_max = vpmaxq_f32(v, v);
     let final_max = vpmaxq_f32(pair_max, pair_max);

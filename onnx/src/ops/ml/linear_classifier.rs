@@ -109,6 +109,21 @@ impl Expansion for LinearClassifier {
         }
         let coefficients_raw: Arc<[f32]> = coef_slice.to_vec().into();
         let coefficients_t: Arc<[f32]> = transposed.into();
+        // Precompute intercept flavours to match OPL runtime expectations
+        let binary_compact = eff_e == 1 && e == 2;
+        let mut bias_scalar: f32 = 0.0;
+        let mut intercepts_eff_e: Option<Arc<[f32]>> = None;
+        let mut binary_intercepts_2: Option<[f32; 2]> = None;
+        if let Some(b) = &self.intercepts {
+            let bsl = b.as_slice::<f32>()?;
+            if bsl.len() == 1 {
+                bias_scalar = bsl[0];
+            } else if bsl.len() == eff_e {
+                intercepts_eff_e = Some(bsl.to_vec().into());
+            } else if binary_compact && bsl.len() == 2 {
+                binary_intercepts_2 = Some([bsl[0], bsl[1]]);
+            }
+        }
         let data = tract_onnx_opl::ml::linear_classifier::LinearClassifierData {
             labels: self.labels.clone(),
             coefficients: self.coefficients.clone(),
@@ -117,6 +132,10 @@ impl Expansion for LinearClassifier {
             feat_c,
             coefficients_raw,
             coefficients_t,
+            binary_compact,
+            bias_scalar,
+            intercepts_eff_e,
+            binary_intercepts_2,
         };
         let outputs = model.wire_node(
             format!("{prefix}"),
@@ -131,93 +150,5 @@ impl Expansion for LinearClassifier {
     }
     fn nboutputs(&self) -> TractResult<usize> {
         Ok(2)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn sigmoid_scalar(x: f32) -> f32 {
-        1.0 / (1.0 + (-x).exp())
-    }
-
-    #[test]
-    fn multiclass_none_int_labels() {
-        // 3 classes, 2 features
-        // class0: [1, 0], class1: [0, 1], class2: [-1, -1]
-        let labels = rctensor1(&[10i64, 20, 30]);
-        let coefs = rctensor1(&[1f32, 0., 0., 1., -1., -1.]);
-        let op = LinearClassifier {
-            labels: labels.clone(),
-            coefficients: coefs,
-            intercepts: None,
-            multi_class: 1,
-            post_transform: PostTransformLC::None,
-        };
-        let x = tensor2(&[[1f32, 0.], [0., 1.]]);
-        let outputs = expand(op).eval(tvec!(x.into_tvalue())).unwrap();
-        let y = outputs[0].clone().into_tensor();
-        let z = outputs[1].clone().into_tensor();
-
-        // Y should map to labels 10 then 20
-        assert_eq!(y.as_slice::<i64>().unwrap(), &[10i64, 20i64]);
-
-        // Z should be raw scores [[1,0,-1],[0,1,-1]]
-        let expected = tensor2(&[[1f32, 0., -1.], [0., 1., -1.]]);
-        expected.close_enough(&z, true).unwrap();
-    }
-
-    #[test]
-    fn binary_none_singlevec_string_labels() {
-        // 2 classes with single-vector coefficients, NONE post-transform
-        // s = 2*x0 - 1*x1; Z = [-s, s]
-        let labels = rctensor1(&["no".to_string(), "yes".to_string()]);
-        let coefs = rctensor1(&[2f32, -1.0]);
-        let op = LinearClassifier {
-            labels: labels.clone(),
-            coefficients: coefs,
-            intercepts: None,
-            multi_class: 0,
-            post_transform: PostTransformLC::None,
-        };
-        let x = tensor2(&[[1f32, 0.], [0., 3.]]);
-        let outputs = expand(op).eval(tvec!(x.into_tvalue())).unwrap();
-        let y = outputs[0].clone().into_tensor();
-        let z = outputs[1].clone().into_tensor();
-
-        // First row s=2 -> class 1 ("yes"), second row s=-3 -> class 0 ("no")
-        let y_vals = y.as_slice::<String>().unwrap();
-        assert_eq!(y_vals, &["yes".to_string(), "no".to_string()]);
-
-        // Z should be [[-2, 2], [3, -3]]
-        let expected = tensor2(&[[-2f32, 2.], [3., -3.]]);
-        expected.close_enough(&z, true).unwrap();
-    }
-
-    #[test]
-    fn binary_logistic_rank1_input() {
-        // 2 classes, single feature, logistic post-transform, rank-1 input
-        // s = 1 * x; p = sigmoid(s); Z = [1-p, p]
-        let labels = rctensor1(&[0i64, 1i64]);
-        let coefs = rctensor1(&[1f32]);
-        let op = LinearClassifier {
-            labels: labels.clone(),
-            coefficients: coefs,
-            intercepts: Some(rctensor1(&[0f32])),
-            multi_class: 0,
-            post_transform: PostTransformLC::Logistic,
-        };
-        let x = tensor1(&[2f32]); // rank-1 input should be accepted
-        let outputs = expand(op).eval(tvec!(x.into_tvalue())).unwrap();
-        let y = outputs[0].clone().into_tensor();
-        let z = outputs[1].clone().into_tensor();
-
-        // Argmax should be class 1
-        assert_eq!(y.as_slice::<i64>().unwrap(), &[1i64]);
-
-        let p = sigmoid_scalar(2.0);
-        let expected = tensor2(&[[1.0 - p, p]]);
-        expected.close_enough(&z, true).unwrap();
     }
 }

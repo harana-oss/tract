@@ -218,7 +218,7 @@ fn dump(
     let coefficients =
         ast.konst_variable(format!("{}_coefficients", node.name), &op.data.coefficients)?;
     let mut args = vec![input, coefficients];
-    let mut named = vec![
+    let named = vec![
         ("targets", numeric(op.data.targets as i64)),
         (
             "post_transform",

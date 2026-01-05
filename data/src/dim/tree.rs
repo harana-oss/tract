@@ -796,6 +796,28 @@ impl TDim {
 
     #[allow(clippy::mutable_key_type)]
     pub fn symbols(&self) -> std::collections::HashSet<Symbol> {
+        if let Some(scope) = self.find_scope() {
+            let lock = scope.0.lock();
+            if let Some(cached) = lock.borrow().symbols_cache_get(self) {
+                return cached;
+            }
+            drop(lock);
+            let computed = match self {
+                Val(_) => maplit::hashset!(),
+                Sym(s) => maplit::hashset!(s.clone()),
+                Add(terms) | Mul(terms) | Broadcast(terms) | Min(terms) | Max(terms) => {
+                    terms.iter().fold(maplit::hashset!(), |mut set, v| {
+                        set.extend(v.symbols());
+                        set
+                    })
+                }
+                MulInt(_, a) => a.symbols(),
+                Div(a, _) => a.symbols(),
+            };
+            let lock = scope.0.lock();
+            lock.borrow().symbols_cache_put(self.clone(), computed.clone());
+            return computed;
+        }
         match self {
             Val(_) => maplit::hashset!(),
             Sym(s) => maplit::hashset!(s.clone()),
