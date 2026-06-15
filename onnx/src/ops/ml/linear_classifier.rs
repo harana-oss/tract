@@ -86,11 +86,6 @@ fn linear_classifier(
 
     if binary_result_layout {
         node.expect(n_classes == 2, "binary result layout requires exactly 2 class labels")?;
-    } else {
-        node.expect(
-            n_classes == e_prime,
-            "class labels length must match number of models when not using binary single-model layout",
-        )?;
     }
 
     let c = raw_coeffs.len() / e_prime;
